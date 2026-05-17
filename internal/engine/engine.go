@@ -71,6 +71,7 @@ func Run(opts Options) error {
 	fmt.Printf("Loaded image: %s (%dx%d), transparency=%v\n", opts.ImagePath, prepared.Width, prepared.Height, prepared.HasTransparency)
 	fmt.Printf("Settings: stopAt=%d randomSamples=%d mutatedSamples=%d saveAt=%d saveEvery(preview)=%d\n",
 		cfg.StopAt, cfg.RandomSamples, cfg.MutatedSamples, len(cfg.SaveAt), cfg.SaveEvery)
+	fmt.Printf("Compatibility mode: forceOpaqueShapes=%v\n", cfg.ForceOpaqueShapes)
 	fmt.Println("Scoring mode: delta error (negative = better, positive = worse)")
 
 	acceptedShapes := 0
@@ -80,7 +81,7 @@ func Run(opts Options) error {
 		step := acceptedShapes + 1
 		stepStart := time.Now()
 		fmt.Printf("[%d/%d] Generating random samples (%d)...\n", step, cfg.StopAt, cfg.RandomSamples)
-		randomCands := randomCandidates(rng, prepared, cfg.RandomSamples)
+		randomCands := randomCandidates(rng, prepared, cfg.RandomSamples, cfg.ForceOpaqueShapes)
 		fmt.Printf("[%d/%d] Evaluating random sample batch on OpenCL (%d)...\n", step, cfg.StopAt, len(randomCands))
 		best, bestScore, err := evaluateBest(evaluator, randomCands)
 		if err != nil {
@@ -90,7 +91,7 @@ func Run(opts Options) error {
 
 		if cfg.MutatedSamples > 0 {
 			fmt.Printf("[%d/%d] Generating mutated samples (%d)...\n", step, cfg.StopAt, cfg.MutatedSamples)
-			mutations := mutatedCandidates(rng, prepared, best, cfg.MutatedSamples)
+			mutations := mutatedCandidates(rng, prepared, best, cfg.MutatedSamples, cfg.ForceOpaqueShapes)
 			fmt.Printf("[%d/%d] Evaluating mutated sample batch on OpenCL (%d)...\n", step, cfg.StopAt, len(mutations))
 			mutBest, mutScore, mutErr := evaluateBest(evaluator, mutations)
 			if mutErr != nil {
@@ -184,7 +185,7 @@ func backgroundShape(p *imageutil.PreparedImage, score float64) model.Shape {
 	}
 }
 
-func randomCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, count int) []model.Candidate {
+func randomCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, count int, forceOpaque bool) []model.Candidate {
 	out := make([]model.Candidate, 0, count)
 	w := float32(prepared.Width)
 	h := float32(prepared.Height)
@@ -205,7 +206,11 @@ func randomCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, count i
 		if alpha < 0.05 {
 			continue
 		}
-		out = append(out, model.Candidate{
+		candAlpha := randRange(rng, 0.2, 1.0) * alpha
+		if forceOpaque {
+			candAlpha = 1.0
+		}
+		cand := model.Candidate{
 			X:     x,
 			Y:     y,
 			RX:    randRange(rng, minRadius, maxRadius),
@@ -214,11 +219,12 @@ func randomCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, count i
 			R:     prepared.Target[ci+0],
 			G:     prepared.Target[ci+1],
 			B:     prepared.Target[ci+2],
-			A:     randRange(rng, 0.2, 1.0) * alpha,
-		})
+			A:     candAlpha,
+		}
+		out = append(out, quantizeCandidate(cand, prepared.Width, prepared.Height))
 	}
 	if len(out) == 0 {
-		out = append(out, model.Candidate{
+		out = append(out, quantizeCandidate(model.Candidate{
 			X:     w * 0.5,
 			Y:     h * 0.5,
 			RX:    maxRadius * 0.25,
@@ -228,12 +234,12 @@ func randomCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, count i
 			G:     0,
 			B:     0,
 			A:     0,
-		})
+		}, prepared.Width, prepared.Height))
 	}
 	return out
 }
 
-func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base model.Candidate, count int) []model.Candidate {
+func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base model.Candidate, count int, forceOpaque bool) []model.Candidate {
 	out := make([]model.Candidate, 0, count)
 	maxAttempts := count * 40
 	attempts := 0
@@ -263,8 +269,12 @@ func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base m
 		cand.R = clamp01(prepared.Target[ci+0] + randRange(rng, -0.08, 0.08))
 		cand.G = clamp01(prepared.Target[ci+1] + randRange(rng, -0.08, 0.08))
 		cand.B = clamp01(prepared.Target[ci+2] + randRange(rng, -0.08, 0.08))
-		cand.A = clamp01(base.A + randRange(rng, -0.15, 0.15))
-		out = append(out, cand)
+		if forceOpaque {
+			cand.A = 1.0
+		} else {
+			cand.A = clamp01(base.A + randRange(rng, -0.15, 0.15))
+		}
+		out = append(out, quantizeCandidate(cand, prepared.Width, prepared.Height))
 	}
 	if len(out) == 0 {
 		out = append(out, base)
@@ -412,6 +422,38 @@ func normalizeScore(totalError, denom float64) float64 {
 		value = 0
 	}
 	return math.Round(value*1_000_000) / 1_000_000
+}
+
+func quantizeCandidate(c model.Candidate, width, height int) model.Candidate {
+	c.X = float32(clampInt(int(math.Round(float64(c.X))), 0, maxInt(0, width-1)))
+	c.Y = float32(clampInt(int(math.Round(float64(c.Y))), 0, maxInt(0, height-1)))
+	c.RX = float32(maxInt(1, int(math.Round(float64(c.RX)))))
+	c.RY = float32(maxInt(1, int(math.Round(float64(c.RY)))))
+
+	angle := int(math.Round(float64(c.Theta))) % 360
+	if angle < 0 {
+		angle += 360
+	}
+	if angle == 0 && c.Theta > 359.5 {
+		angle = 360
+	}
+	c.Theta = float32(angle)
+
+	c.R = float32(f32ToByte(c.R)) / 255.0
+	c.G = float32(f32ToByte(c.G)) / 255.0
+	c.B = float32(f32ToByte(c.B)) / 255.0
+	c.A = float32(f32ToByte(c.A)) / 255.0
+	return c
+}
+
+func clampInt(v, minV, maxV int) int {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
 }
 
 func maxInt(a, b int) int {

@@ -1,17 +1,18 @@
 package model
 
 type Settings struct {
-	Description     string
-	MaxPreviewSize  int
-	MaxResolution   int
-	MaxThreads      int
-	MutatedSamples  int
-	PosterizeLevels int
-	PreviewEvery    int
-	RandomSamples   int
-	SaveAt          map[int]struct{}
-	SaveEvery       int
-	StopAt          int
+	Description       string
+	MaxPreviewSize    int
+	MaxResolution     int
+	MaxThreads        int
+	MutatedSamples    int
+	ForceOpaqueShapes bool
+	PosterizeLevels   int
+	PreviewEvery      int
+	RandomSamples     int
+	SaveAt            map[int]struct{}
+	SaveEvery         int
+	StopAt            int
 }
 
 type Shape struct {

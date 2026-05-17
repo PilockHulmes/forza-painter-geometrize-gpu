@@ -84,6 +84,10 @@ func LoadAndPrepare(path string, maxResolution int) (*PreparedImage, error) {
 		bg[3] = uint8(clamp255(sumA / opaqueCount * 255.0))
 	}
 	if hasTransparency {
+		// Keep compatibility with forza-painter preview conventions.
+		bg[0] = 255
+		bg[1] = 0
+		bg[2] = 255
 		bg[3] = 0
 	}
 

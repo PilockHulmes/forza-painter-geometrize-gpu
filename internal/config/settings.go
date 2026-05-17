@@ -13,17 +13,18 @@ import (
 
 func DefaultSettings() model.Settings {
 	return model.Settings{
-		Description:     "Default profile",
-		MaxPreviewSize:  500,
-		MaxResolution:   2000,
-		MaxThreads:      0,
-		MutatedSamples:  1000,
-		PosterizeLevels: 20,
-		PreviewEvery:    10,
-		RandomSamples:   3000,
-		SaveAt:          map[int]struct{}{500: {}, 1000: {}, 1500: {}, 2000: {}, 2500: {}, 3000: {}},
-		SaveEvery:       10,
-		StopAt:          3000,
+		Description:       "Default profile",
+		MaxPreviewSize:    500,
+		MaxResolution:     2000,
+		MaxThreads:        0,
+		MutatedSamples:    1000,
+		ForceOpaqueShapes: true,
+		PosterizeLevels:   20,
+		PreviewEvery:      10,
+		RandomSamples:     3000,
+		SaveAt:            map[int]struct{}{500: {}, 1000: {}, 1500: {}, 2000: {}, 2500: {}, 3000: {}},
+		SaveEvery:         10,
+		StopAt:            3000,
 	}
 }
 
@@ -86,6 +87,8 @@ func ParseSettings(path string) (model.Settings, error) {
 			cfg.MaxThreads = parseInt(value, cfg.MaxThreads)
 		case "mutatedSamples":
 			cfg.MutatedSamples = parseInt(value, cfg.MutatedSamples)
+		case "forceOpaqueShapes":
+			cfg.ForceOpaqueShapes = parseBool(value, cfg.ForceOpaqueShapes)
 		case "posterizeLevels":
 			cfg.PosterizeLevels = parseInt(value, cfg.PosterizeLevels)
 		case "previewEvery":
@@ -125,6 +128,18 @@ func parseInt(value string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func parseBool(value string, fallback bool) bool {
+	v := strings.TrimSpace(strings.ToLower(value))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func parseSaveAt(value string) map[int]struct{} {

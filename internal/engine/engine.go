@@ -32,8 +32,7 @@ const (
 	// Hill climb tuning. The mutation budget from settings is split into
 	// up to maxHillClimbRounds rounds; each round mutates the current best
 	// shape geometry slightly, evaluates the batch on GPU, and keeps any
-	// improvement before starting the next round. This is the standard
-	// geometrize-style hill climb adapted to GPU-friendly batches.
+	// improvement before starting the next round.
 	maxHillClimbRounds  = 32
 	idealHillClimbBatch = 64
 	minHillClimbRounds  = 1
@@ -78,13 +77,16 @@ func Run(opts Options) error {
 	shapes := []model.Shape{backgroundShape(prepared, normalizeScore(currentError, denom))}
 
 	moveStep, radiusStep := mutationSteps(prepared.Width, prepared.Height)
-
 	hillClimbRounds, mutationsPerRound := planHillClimb(cfg.MutatedSamples)
 
-	sampler, err := refreshSampler(evaluator, prepared)
+	// Initial sampler is computed synchronously - the engine has nothing
+	// useful to do until the first random batch can be sampled.
+	initialGrid, gw, gh, err := evaluator.ErrorGrid()
 	if err != nil {
 		return err
 	}
+	sampler := newErrorSampler(initialGrid, gw, gh, prepared.Width, prepared.Height)
+	var pendingGrid gpu.GridTicket // not valid initially
 
 	fmt.Printf("Loaded image: %s (%dx%d), transparency=%v\n", opts.ImagePath, prepared.Width, prepared.Height, prepared.HasTransparency)
 	fmt.Printf("Settings: stopAt=%d randomSamples=%d mutatedSamples=%d saveAt=%d saveEvery(preview)=%d\n",
@@ -92,6 +94,7 @@ func Run(opts Options) error {
 	fmt.Printf("Compatibility mode: forceOpaqueShapes=%v\n", cfg.ForceOpaqueShapes)
 	fmt.Printf("Hill climb: %d rounds x %d mutations (move +/- %.1fpx, radius +/- %.1fpx, theta +/- 30deg)\n",
 		hillClimbRounds, mutationsPerRound, moveStep, radiusStep)
+	fmt.Println("Pipeline: async (in-order queue, ring=2; sampler 1-shape stale)")
 	fmt.Println("Scoring mode: delta error with GPU-computed optimal color (negative = better)")
 
 	acceptedShapes := 0
@@ -101,9 +104,13 @@ func Run(opts Options) error {
 		step := acceptedShapes + 1
 		stepStart := time.Now()
 		fmt.Printf("[%d/%d] Generating random samples (%d)...\n", step, cfg.StopAt, cfg.RandomSamples)
+		// While we generate random candidates on the CPU, the GPU may
+		// still be running the previous shape's apply + error-grid
+		// kernels (queued non-blocking at the end of the last iteration).
 		randomCands := randomCandidates(rng, prepared, cfg.RandomSamples, cfg.ForceOpaqueShapes, sampler)
+
 		fmt.Printf("[%d/%d] Evaluating random sample batch on OpenCL (%d)...\n", step, cfg.StopAt, len(randomCands))
-		best, bestScore, err := evaluateBest(evaluator, randomCands)
+		best, bestScore, err := submitAndPickBest(evaluator, randomCands)
 		if err != nil {
 			return err
 		}
@@ -113,7 +120,7 @@ func Run(opts Options) error {
 			improved := 0
 			for round := 0; round < hillClimbRounds; round++ {
 				mutations := mutatedCandidates(rng, prepared, best, mutationsPerRound, cfg.ForceOpaqueShapes, moveStep, radiusStep)
-				roundBest, roundScore, mutErr := evaluateBest(evaluator, mutations)
+				roundBest, roundScore, mutErr := submitAndPickBest(evaluator, mutations)
 				if mutErr != nil {
 					return mutErr
 				}
@@ -134,17 +141,22 @@ func Run(opts Options) error {
 				fmt.Printf("Stopped early: reached max retries without improvement (%d)\n", maxNoImproveRetries)
 				break
 			}
+			// Image state didn't change, sampler & pendingGrid still
+			// describe the right canvas state; just loop and retry with
+			// fresh random candidates.
 			continue
 		}
 
 		consecutiveNoImprove = 0
 
-		// Quantize geometry + colour to the integer grid that will end up in
-		// the JSON; apply that exact shape so the GPU canvas matches what the
-		// game will render from the JSON later.
+		// Quantize geometry + colour to the integer grid that will end
+		// up in the JSON; apply that exact shape so the GPU canvas
+		// matches what the game will render from the JSON later.
 		final := quantizeCandidate(best, prepared.Width, prepared.Height, cfg.ForceOpaqueShapes)
 
-		if err := evaluator.Apply(final); err != nil {
+		// Submit apply non-blocking; the in-order queue ensures any
+		// follow-up eval / grid kernel sees the updated canvas.
+		if err := evaluator.SubmitApply(final); err != nil {
 			return err
 		}
 		currentError += float64(bestScore)
@@ -155,13 +167,6 @@ func Run(opts Options) error {
 		acceptedShapes++
 		fmt.Printf("[%d/%d] Added rotated ellipse #%d (delta %.6f)\n", acceptedShapes, cfg.StopAt, len(shapes)-1, bestScore)
 
-		// Refresh the error histogram for biased sampling on the next step.
-		newSampler, sErr := refreshSampler(evaluator, prepared)
-		if sErr != nil {
-			return sErr
-		}
-		sampler = newSampler
-
 		if shouldSave(acceptedShapes, cfg) {
 			if err := saveShapes(opts, shapes, acceptedShapes); err != nil {
 				return err
@@ -170,6 +175,10 @@ func Run(opts Options) error {
 		}
 
 		if shouldSavePreview(acceptedShapes, cfg) {
+			// ReadCurrent does a blocking read on the in-order queue, so
+			// it implicitly waits for the apply we just submitted (and
+			// any prior pending kernels). It does NOT touch the grid
+			// ticket bookkeeping.
 			if err := savePreviewSnapshot(evaluator, opts, prepared.Width, prepared.Height, acceptedShapes); err != nil {
 				return err
 			}
@@ -178,11 +187,43 @@ func Run(opts Options) error {
 			}
 		}
 
+		// Consume the previous shape's grid (its read finished long ago,
+		// so this is essentially a free poll) and rebuild the sampler
+		// from it. The sampler now reflects the canvas state one shape
+		// behind real time; that's the cost of overlapping CPU random
+		// generation with the GPU pipeline. Quality impact is negligible
+		// because one shape changes <1% of pixels.
+		if pendingGrid.Valid() {
+			grid, gridW, gridH, gErr := evaluator.WaitErrorGrid(pendingGrid)
+			if gErr != nil {
+				return gErr
+			}
+			sampler = newErrorSampler(grid, gridW, gridH, prepared.Width, prepared.Height)
+			pendingGrid = gpu.GridTicket{}
+		}
+
+		// Submit the grid kernel for the canvas-just-applied. It's
+		// queued behind the apply; we'll consume the result next
+		// iteration.
+		newTicket, gErr := evaluator.SubmitErrorGrid()
+		if gErr != nil {
+			return gErr
+		}
+		pendingGrid = newTicket
+
 		fmt.Printf("[%d/%d] Step completed in %s\n", acceptedShapes, cfg.StopAt, time.Since(stepStart).Round(time.Millisecond))
 	}
 
 	if acceptedShapes < cfg.StopAt {
 		fmt.Printf("Finished early with %d/%d shapes due to no-improvement stopping rule\n", acceptedShapes, cfg.StopAt)
+	}
+
+	// Drain any pending grid ticket so its event is released cleanly.
+	if pendingGrid.Valid() {
+		if _, _, _, err := evaluator.WaitErrorGrid(pendingGrid); err != nil {
+			return err
+		}
+		pendingGrid = gpu.GridTicket{}
 	}
 
 	if err := output.SaveGeometry(output.BuildFinalOutputPath(resolveOutputBase(opts)), shapes); err != nil {
@@ -219,11 +260,9 @@ func backgroundShape(p *imageutil.PreparedImage, score float64) model.Shape {
 }
 
 // planHillClimb splits the configured mutation budget into a number of
-// rounds and a per-round batch size. Each round will be a single GPU
-// dispatch and the best shape from that dispatch becomes the seed of the
-// next round (real hill climbing). We aim for ~64 candidates per round to
-// keep the GPU occupied while still giving the climb enough steps to walk
-// uphill instead of just sampling around the random seed.
+// rounds and a per-round batch size. We aim for ~64 candidates per round
+// to keep the GPU occupied while still giving the climb enough steps to
+// walk uphill instead of just sampling around the random seed.
 func planHillClimb(budget int) (rounds, perRound int) {
 	if budget <= 0 {
 		return 0, 0
@@ -279,7 +318,11 @@ func newErrorSampler(grid []float32, gridW, gridH, imgW, imgH int) *errorSampler
 }
 
 func (s *errorSampler) sample(rng *rand.Rand) (float32, float32) {
-	if s == nil || s.total <= 0 || s.gridW <= 0 || s.gridH <= 0 {
+	// Defensive nil-check first so the fallback below can safely deref s.
+	if s == nil {
+		return 0, 0
+	}
+	if s.total <= 0 || s.gridW <= 0 || s.gridH <= 0 {
 		return rng.Float32() * float32(s.imgW), rng.Float32() * float32(s.imgH)
 	}
 	u := rng.Float64() * s.total
@@ -316,14 +359,6 @@ func (s *errorSampler) sample(rng *rand.Rand) (float32, float32) {
 	return x, y
 }
 
-func refreshSampler(evaluator *gpu.Evaluator, prepared *imageutil.PreparedImage) (*errorSampler, error) {
-	grid, gw, gh, err := evaluator.ErrorGrid()
-	if err != nil {
-		return nil, err
-	}
-	return newErrorSampler(grid, gw, gh, prepared.Width, prepared.Height), nil
-}
-
 // randomCandidates seeds candidates whose CENTER is biased towards the
 // regions of the image that still have the most error. Geometry (radius,
 // angle) is randomized; color is left zero because the GPU evaluator
@@ -339,11 +374,8 @@ func randomCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, count i
 		maxRadius = 4
 	}
 	minRadius := float32(2)
-	maxAttempts := count * 4
-	attempts := 0
 
-	for len(out) < count && attempts < maxAttempts {
-		attempts++
+	for i := 0; i < count; i++ {
 		x, y := sampler.sample(rng)
 		if x < 0 {
 			x = 0
@@ -426,11 +458,16 @@ func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base m
 	return out
 }
 
-// evaluateBest dispatches the batch on the GPU, picks the lowest-score
-// candidate and merges the GPU-computed optimal color into it so that
-// subsequent hill-climb rounds work from the correct base color.
-func evaluateBest(e *gpu.Evaluator, cands []model.Candidate) (model.Candidate, float32, error) {
-	results, err := e.Evaluate(cands)
+// submitAndPickBest submits a candidate batch, waits for the result and
+// returns the lowest-score candidate with its GPU-computed optimal color
+// merged in. This is the tight inner loop of both random sampling and
+// hill climb.
+func submitAndPickBest(e *gpu.Evaluator, cands []model.Candidate) (model.Candidate, float32, error) {
+	t, err := e.SubmitEval(cands)
+	if err != nil {
+		return model.Candidate{}, 0, err
+	}
+	results, err := e.WaitEval(t)
 	if err != nil {
 		return model.Candidate{}, 0, err
 	}
@@ -565,10 +602,10 @@ func normalizeScore(totalError, denom float64) float64 {
 	return math.Round(value*1_000_000) / 1_000_000
 }
 
-// quantizeCandidate is now only invoked at acceptance time. The GPU search
-// runs on full-precision floats; the final shape that is committed both to
-// the canvas and to the JSON gets snapped to the integer grid the game
-// expects (pixel positions, integer angle, 8-bit colour).
+// quantizeCandidate is now only invoked at acceptance time. The GPU
+// search runs on full-precision floats; the final shape that is committed
+// both to the canvas and to the JSON gets snapped to the integer grid the
+// game expects (pixel positions, integer angle, 8-bit colour).
 func quantizeCandidate(c model.Candidate, width, height int, forceOpaque bool) model.Candidate {
 	c.X = float32(clampInt(int(math.Round(float64(c.X))), 0, maxInt(0, width-1)))
 	c.Y = float32(clampInt(int(math.Round(float64(c.Y))), 0, maxInt(0, height-1)))

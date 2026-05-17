@@ -14,8 +14,16 @@ import (
 // for biasing random candidate placement towards high-error regions.
 const ErrorGridSize = 64
 
+// ringSize is the number of candidate / result / grid host+device staging
+// buffers kept in flight. With size 2 the engine can submit work for the
+// next round while the previous round is still being read back, which is
+// the foundation that lets us hide CPU candidate generation behind GPU
+// kernels (e.g. apply + grid recompute) without ever stalling on a
+// blocking transfer.
+const ringSize = 2
+
 // EvalResult holds the score and the optimal RGB color for a single
-// evaluated candidate. RGB is computed analytically by the GPU, the engine
+// evaluated candidate. RGB is computed analytically by the GPU; the engine
 // stores it back into the candidate before applying the chosen shape.
 type EvalResult struct {
 	Score float32
@@ -24,28 +32,77 @@ type EvalResult struct {
 	B     float32
 }
 
+// EvalTicket is returned by SubmitEval and consumed by WaitEval. It is
+// just a typed handle into the evaluator's ring of in-flight slots; the
+// sequence number guards against stale tickets being waited on twice.
+type EvalTicket struct {
+	slot  int
+	seq   uint64
+	count int
+	valid bool
+}
+
+// GridTicket is the equivalent handle for an in-flight error-grid update.
+type GridTicket struct {
+	slot  int
+	seq   uint64
+	valid bool
+}
+
+// Valid reports whether the ticket refers to an actual in-flight
+// submission. The zero value of GridTicket is invalid.
+func (t GridTicket) Valid() bool { return t.valid }
+
+// Valid reports whether the ticket refers to an actual in-flight
+// submission. The zero value of EvalTicket is invalid.
+func (t EvalTicket) Valid() bool { return t.valid }
+
+type evalSlot struct {
+	readEvt *cl.Event
+	seq     uint64
+	busy    bool
+}
+
+type gridSlot struct {
+	readEvt *cl.Event
+	seq     uint64
+	busy    bool
+}
+
 type Evaluator struct {
-	context        *cl.Context
-	queue          *cl.CommandQueue
-	program        *cl.Program
-	evalKernel     *cl.Kernel
-	applyKernel    *cl.Kernel
-	gridKernel     *cl.Kernel
-	targetBuffer   *cl.MemObject
-	currentBuffer  *cl.MemObject
-	maskBuffer     *cl.MemObject
-	candBuffer     *cl.MemObject
-	resultBuffer   *cl.MemObject
-	errorGridBuf   *cl.MemObject
-	width          int
-	height         int
-	pixelCount     int
-	maxCandidates  int
-	hostPacked     []float32
-	hostResults    []float32
-	gridW          int
-	gridH          int
-	hostErrorGrid  []float32
+	context     *cl.Context
+	queue       *cl.CommandQueue
+	program     *cl.Program
+	evalKernel  *cl.Kernel
+	applyKernel *cl.Kernel
+	gridKernel  *cl.Kernel
+
+	targetBuffer  *cl.MemObject
+	currentBuffer *cl.MemObject
+	maskBuffer    *cl.MemObject
+
+	// Eval ring.
+	candBuffers   [ringSize]*cl.MemObject
+	resultBuffers [ringSize]*cl.MemObject
+	hostCands     [ringSize][]float32
+	hostResults   [ringSize][]float32
+	evalSlots     [ringSize]evalSlot
+	nextEvalSlot  int
+	evalSeq       uint64
+
+	// Grid ring.
+	errorGridBufs  [ringSize]*cl.MemObject
+	hostErrorGrids [ringSize][]float32
+	gridSlots      [ringSize]gridSlot
+	nextGridSlot   int
+	gridSeq        uint64
+
+	width         int
+	height        int
+	pixelCount    int
+	maxCandidates int
+	gridW         int
+	gridH         int
 }
 
 func NewEvaluator(target, current []float32, mask []uint8, width, height int, maxCandidates int) (*Evaluator, error) {
@@ -152,126 +209,131 @@ func NewEvaluator(target, current []float32, mask []uint8, width, height int, ma
 		gridH = 1
 	}
 
-	targetBuffer, err := ctx.CreateEmptyBuffer(cl.MemReadOnly, len(target)*4)
-	if err != nil {
-		gridKernel.Release()
-		applyKernel.Release()
-		evalKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	currentBuffer, err := ctx.CreateEmptyBuffer(cl.MemReadWrite, len(current)*4)
-	if err != nil {
-		targetBuffer.Release()
-		gridKernel.Release()
-		applyKernel.Release()
-		evalKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	maskBuffer, err := ctx.CreateEmptyBuffer(cl.MemReadOnly, len(mask))
-	if err != nil {
-		currentBuffer.Release()
-		targetBuffer.Release()
-		gridKernel.Release()
-		applyKernel.Release()
-		evalKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	candBuffer, err := ctx.CreateEmptyBuffer(cl.MemReadOnly, maxCandidates*6*4)
-	if err != nil {
-		maskBuffer.Release()
-		currentBuffer.Release()
-		targetBuffer.Release()
-		gridKernel.Release()
-		applyKernel.Release()
-		evalKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	resultBuffer, err := ctx.CreateEmptyBuffer(cl.MemWriteOnly, maxCandidates*4*4)
-	if err != nil {
-		candBuffer.Release()
-		maskBuffer.Release()
-		currentBuffer.Release()
-		targetBuffer.Release()
-		gridKernel.Release()
-		applyKernel.Release()
-		evalKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-	errorGridBuf, err := ctx.CreateEmptyBuffer(cl.MemReadWrite, gridW*gridH*4)
-	if err != nil {
-		resultBuffer.Release()
-		candBuffer.Release()
-		maskBuffer.Release()
-		currentBuffer.Release()
-		targetBuffer.Release()
-		gridKernel.Release()
-		applyKernel.Release()
-		evalKernel.Release()
-		program.Release()
-		queue.Release()
-		ctx.Release()
-		return nil, err
-	}
-
-	if _, err := queue.EnqueueWriteBufferFloat32(targetBuffer, true, 0, target, nil); err != nil {
-		return nil, err
-	}
-	if _, err := queue.EnqueueWriteBufferFloat32(currentBuffer, true, 0, current, nil); err != nil {
-		return nil, err
-	}
-	if _, err := queue.EnqueueWriteBuffer(maskBuffer, true, 0, len(mask), unsafe.Pointer(&mask[0]), nil); err != nil {
-		return nil, err
-	}
-
-	return &Evaluator{
+	e := &Evaluator{
 		context:       ctx,
 		queue:         queue,
 		program:       program,
 		evalKernel:    evalKernel,
 		applyKernel:   applyKernel,
 		gridKernel:    gridKernel,
-		targetBuffer:  targetBuffer,
-		currentBuffer: currentBuffer,
-		maskBuffer:    maskBuffer,
-		candBuffer:    candBuffer,
-		resultBuffer:  resultBuffer,
-		errorGridBuf:  errorGridBuf,
 		width:         width,
 		height:        height,
 		pixelCount:    width * height,
 		maxCandidates: maxCandidates,
-		hostPacked:    make([]float32, maxCandidates*6),
-		hostResults:   make([]float32, maxCandidates*4),
 		gridW:         gridW,
 		gridH:         gridH,
-		hostErrorGrid: make([]float32, gridW*gridH),
-	}, nil
+	}
+
+	cleanup := func() {
+		for i := 0; i < ringSize; i++ {
+			if e.candBuffers[i] != nil {
+				e.candBuffers[i].Release()
+			}
+			if e.resultBuffers[i] != nil {
+				e.resultBuffers[i].Release()
+			}
+			if e.errorGridBufs[i] != nil {
+				e.errorGridBufs[i].Release()
+			}
+		}
+		if e.maskBuffer != nil {
+			e.maskBuffer.Release()
+		}
+		if e.currentBuffer != nil {
+			e.currentBuffer.Release()
+		}
+		if e.targetBuffer != nil {
+			e.targetBuffer.Release()
+		}
+		gridKernel.Release()
+		applyKernel.Release()
+		evalKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+	}
+
+	if e.targetBuffer, err = ctx.CreateEmptyBuffer(cl.MemReadOnly, len(target)*4); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if e.currentBuffer, err = ctx.CreateEmptyBuffer(cl.MemReadWrite, len(current)*4); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if e.maskBuffer, err = ctx.CreateEmptyBuffer(cl.MemReadOnly, len(mask)); err != nil {
+		cleanup()
+		return nil, err
+	}
+
+	for i := 0; i < ringSize; i++ {
+		buf, bErr := ctx.CreateEmptyBuffer(cl.MemReadOnly, maxCandidates*6*4)
+		if bErr != nil {
+			cleanup()
+			return nil, bErr
+		}
+		e.candBuffers[i] = buf
+		rbuf, rErr := ctx.CreateEmptyBuffer(cl.MemWriteOnly, maxCandidates*4*4)
+		if rErr != nil {
+			cleanup()
+			return nil, rErr
+		}
+		e.resultBuffers[i] = rbuf
+		gbuf, gErr := ctx.CreateEmptyBuffer(cl.MemReadWrite, gridW*gridH*4)
+		if gErr != nil {
+			cleanup()
+			return nil, gErr
+		}
+		e.errorGridBufs[i] = gbuf
+
+		e.hostCands[i] = make([]float32, maxCandidates*6)
+		e.hostResults[i] = make([]float32, maxCandidates*4)
+		e.hostErrorGrids[i] = make([]float32, gridW*gridH)
+	}
+
+	// Initial uploads. These are blocking because the engine has nothing
+	// useful to do until the buffers are resident anyway. We still release
+	// the returned events explicitly so the OpenCL runtime can free them
+	// promptly instead of waiting for the Go finalizer to run.
+	if evt, err := queue.EnqueueWriteBufferFloat32(e.targetBuffer, true, 0, target, nil); err != nil {
+		cleanup()
+		return nil, err
+	} else if evt != nil {
+		evt.Release()
+	}
+	if evt, err := queue.EnqueueWriteBufferFloat32(e.currentBuffer, true, 0, current, nil); err != nil {
+		cleanup()
+		return nil, err
+	} else if evt != nil {
+		evt.Release()
+	}
+	if evt, err := queue.EnqueueWriteBuffer(e.maskBuffer, true, 0, len(mask), unsafe.Pointer(&mask[0]), nil); err != nil {
+		cleanup()
+		return nil, err
+	} else if evt != nil {
+		evt.Release()
+	}
+
+	return e, nil
 }
 
 func (e *Evaluator) Close() {
-	if e.errorGridBuf != nil {
-		e.errorGridBuf.Release()
-	}
-	if e.resultBuffer != nil {
-		e.resultBuffer.Release()
-	}
-	if e.candBuffer != nil {
-		e.candBuffer.Release()
+	// Drain queue first so no async work touches buffers we are about to
+	// release. Flush also clears every slot's event/busy bookkeeping, so
+	// we don't need a second pass to release events here. Errors are
+	// deliberately ignored - we are tearing down.
+	_ = e.Flush()
+
+	for i := 0; i < ringSize; i++ {
+		if e.errorGridBufs[i] != nil {
+			e.errorGridBufs[i].Release()
+		}
+		if e.resultBuffers[i] != nil {
+			e.resultBuffers[i].Release()
+		}
+		if e.candBuffers[i] != nil {
+			e.candBuffers[i].Release()
+		}
 	}
 	if e.maskBuffer != nil {
 		e.maskBuffer.Release()
@@ -302,19 +364,62 @@ func (e *Evaluator) Close() {
 	}
 }
 
-// Evaluate dispatches the candidate batch to the GPU and returns one
-// EvalResult per candidate (score + analytically computed optimal color).
-func (e *Evaluator) Evaluate(candidates []model.Candidate) ([]EvalResult, error) {
-	count := len(candidates)
+// Flush blocks until every command previously enqueued on the internal
+// command queue has finished and clears the bookkeeping for in-flight
+// slots so they can be reused. Useful at the end of the run or before
+// reading data through paths that assume no pending work (e.g. preview).
+func (e *Evaluator) Flush() error {
+	if e.queue == nil {
+		return nil
+	}
+	if err := e.queue.Finish(); err != nil {
+		return err
+	}
+	for i := 0; i < ringSize; i++ {
+		if e.evalSlots[i].busy && e.evalSlots[i].readEvt != nil {
+			e.evalSlots[i].readEvt.Release()
+			e.evalSlots[i].readEvt = nil
+			e.evalSlots[i].busy = false
+		}
+		if e.gridSlots[i].busy && e.gridSlots[i].readEvt != nil {
+			e.gridSlots[i].readEvt.Release()
+			e.gridSlots[i].readEvt = nil
+			e.gridSlots[i].busy = false
+		}
+	}
+	return nil
+}
+
+// SubmitEval enqueues a candidate batch evaluation without blocking on the
+// GPU. The caller must invoke WaitEval on the returned ticket before the
+// host data backing the candidates becomes irrelevant; in practice the
+// engine submits a batch, optionally does a tiny bit of CPU work, and then
+// waits. The ring buffer guarantees that submitting more batches than the
+// ring size is safe (the next slot is reclaimed with a defensive wait).
+func (e *Evaluator) SubmitEval(cands []model.Candidate) (EvalTicket, error) {
+	count := len(cands)
 	if count == 0 {
-		return nil, nil
+		return EvalTicket{}, nil
 	}
 	if count > e.maxCandidates {
-		return nil, fmt.Errorf("candidate count %d exceeds max %d", count, e.maxCandidates)
+		return EvalTicket{}, fmt.Errorf("candidate count %d exceeds max %d", count, e.maxCandidates)
 	}
 
-	packed := e.hostPacked[:count*6]
-	for i, c := range candidates {
+	slot := e.nextEvalSlot
+	e.nextEvalSlot = (e.nextEvalSlot + 1) % ringSize
+
+	if e.evalSlots[slot].busy {
+		// Engine forgot to consume an outstanding ticket; reclaim the slot.
+		if err := cl.WaitForEvents([]*cl.Event{e.evalSlots[slot].readEvt}); err != nil {
+			return EvalTicket{}, err
+		}
+		e.evalSlots[slot].readEvt.Release()
+		e.evalSlots[slot].readEvt = nil
+		e.evalSlots[slot].busy = false
+	}
+
+	packed := e.hostCands[slot][:count*6]
+	for i, c := range cands {
 		base := i * 6
 		packed[base+0] = c.X
 		packed[base+1] = c.Y
@@ -324,33 +429,73 @@ func (e *Evaluator) Evaluate(candidates []model.Candidate) ([]EvalResult, error)
 		packed[base+5] = c.A
 	}
 
-	if _, err := e.queue.EnqueueWriteBufferFloat32(e.candBuffer, true, 0, packed, nil); err != nil {
-		return nil, err
+	// Non-blocking write. The OpenCL spec snapshots the host pointer's
+	// contents at command submission, but the runtime is allowed to defer
+	// the actual transfer; either way our hostCands slot is not reused
+	// until the ring wraps and reclaims it.
+	writeEvt, err := e.queue.EnqueueWriteBufferFloat32(e.candBuffers[slot], false, 0, packed, nil)
+	if err != nil {
+		return EvalTicket{}, err
 	}
+	writeEvt.Release()
 
 	if err := e.evalKernel.SetArgs(
 		e.targetBuffer,
 		e.currentBuffer,
 		e.maskBuffer,
-		e.candBuffer,
-		e.resultBuffer,
+		e.candBuffers[slot],
+		e.resultBuffers[slot],
 		int32(e.width),
 		int32(e.height),
 	); err != nil {
-		return nil, err
+		return EvalTicket{}, err
 	}
 
-	globalSize := []int{count}
-	if _, err := e.queue.EnqueueNDRangeKernel(e.evalKernel, nil, globalSize, nil, nil); err != nil {
-		return nil, err
+	// clEnqueueNDRangeKernel snapshots its arguments at enqueue time, so
+	// it is safe to set new args for a different slot in the next call
+	// even though this kernel hasn't actually executed yet.
+	kernelEvt, err := e.queue.EnqueueNDRangeKernel(e.evalKernel, nil, []int{count}, nil, nil)
+	if err != nil {
+		return EvalTicket{}, err
+	}
+	kernelEvt.Release()
+
+	flat := e.hostResults[slot][:count*4]
+	readEvt, err := e.queue.EnqueueReadBufferFloat32(e.resultBuffers[slot], false, 0, flat, nil)
+	if err != nil {
+		return EvalTicket{}, err
 	}
 
-	flat := e.hostResults[:count*4]
-	if _, err := e.queue.EnqueueReadBufferFloat32(e.resultBuffer, true, 0, flat, nil); err != nil {
+	e.evalSeq++
+	e.evalSlots[slot] = evalSlot{
+		readEvt: readEvt,
+		seq:     e.evalSeq,
+		busy:    true,
+	}
+	return EvalTicket{slot: slot, seq: e.evalSeq, count: count, valid: true}, nil
+}
+
+// WaitEval blocks until the given submission's read transfer completes and
+// returns the per-candidate results. After this call the slot is freed and
+// the ticket is exhausted.
+func (e *Evaluator) WaitEval(t EvalTicket) ([]EvalResult, error) {
+	if !t.valid {
+		return nil, nil
+	}
+	s := &e.evalSlots[t.slot]
+	if !s.busy || s.seq != t.seq {
+		return nil, fmt.Errorf("WaitEval: stale or invalid ticket")
+	}
+	if err := cl.WaitForEvents([]*cl.Event{s.readEvt}); err != nil {
 		return nil, err
 	}
-	out := make([]EvalResult, count)
-	for i := 0; i < count; i++ {
+	s.readEvt.Release()
+	s.readEvt = nil
+	s.busy = false
+
+	flat := e.hostResults[t.slot][:t.count*4]
+	out := make([]EvalResult, t.count)
+	for i := 0; i < t.count; i++ {
 		out[i] = EvalResult{
 			Score: flat[i*4+0],
 			R:     flat[i*4+1],
@@ -361,9 +506,20 @@ func (e *Evaluator) Evaluate(candidates []model.Candidate) ([]EvalResult, error)
 	return out, nil
 }
 
-// Apply blends the (already chosen) candidate into the current canvas.
-// The kernel only runs on the candidate's bounding box.
-func (e *Evaluator) Apply(candidate model.Candidate) error {
+// Evaluate is the synchronous helper used by code paths that don't care
+// about overlap. It is implemented in terms of Submit/Wait.
+func (e *Evaluator) Evaluate(cands []model.Candidate) ([]EvalResult, error) {
+	t, err := e.SubmitEval(cands)
+	if err != nil {
+		return nil, err
+	}
+	return e.WaitEval(t)
+}
+
+// SubmitApply enqueues a blend kernel for the given candidate without
+// blocking. The in-order command queue guarantees that any subsequent
+// SubmitEval / SubmitErrorGrid will observe the updated current canvas.
+func (e *Evaluator) SubmitApply(candidate model.Candidate) error {
 	rx := candidate.RX
 	ry := candidate.RY
 	if rx < 1 {
@@ -386,7 +542,6 @@ func (e *Evaluator) Apply(candidate model.Candidate) error {
 	xMax := int(math.Ceil(float64(candidate.X) + ex + 1.0))
 	yMin := int(math.Floor(float64(candidate.Y) - ey - 1.0))
 	yMax := int(math.Ceil(float64(candidate.Y) + ey + 1.0))
-
 	if xMin < 0 {
 		xMin = 0
 	}
@@ -428,47 +583,119 @@ func (e *Evaluator) Apply(candidate model.Candidate) error {
 		return err
 	}
 
-	globalSize := []int{bw, bh}
-	if _, err := e.queue.EnqueueNDRangeKernel(e.applyKernel, nil, globalSize, nil, nil); err != nil {
+	evt, err := e.queue.EnqueueNDRangeKernel(e.applyKernel, nil, []int{bw, bh}, nil, nil)
+	if err != nil {
 		return err
 	}
+	evt.Release()
 	return nil
 }
 
-func (e *Evaluator) ReadCurrent(dst []float32) error {
-	if len(dst) != e.pixelCount*4 {
-		return fmt.Errorf("destination length mismatch")
+// Apply is the synchronous helper used by tests / single-call flows. It
+// drains the queue via Flush so that any in-flight ticket events that
+// happen to complete during the wait are also reaped, keeping the slot
+// bookkeeping consistent with the async path.
+func (e *Evaluator) Apply(candidate model.Candidate) error {
+	if err := e.SubmitApply(candidate); err != nil {
+		return err
 	}
-	_, err := e.queue.EnqueueReadBufferFloat32(e.currentBuffer, true, 0, dst, nil)
-	return err
+	return e.Flush()
 }
 
-// ErrorGrid recomputes the downsampled per-cell squared error map and
-// returns it together with its dimensions. Cells are summed over the
-// pixels they cover; transparent (masked) pixels are ignored.
-func (e *Evaluator) ErrorGrid() ([]float32, int, int, error) {
+// SubmitErrorGrid enqueues a downsampled error histogram computation and
+// the corresponding readback without blocking. The histogram cells reflect
+// the canvas state at the moment the kernel runs in the queue, i.e. after
+// any apply commands previously submitted on the same queue.
+func (e *Evaluator) SubmitErrorGrid() (GridTicket, error) {
+	slot := e.nextGridSlot
+	e.nextGridSlot = (e.nextGridSlot + 1) % ringSize
+
+	if e.gridSlots[slot].busy {
+		if err := cl.WaitForEvents([]*cl.Event{e.gridSlots[slot].readEvt}); err != nil {
+			return GridTicket{}, err
+		}
+		e.gridSlots[slot].readEvt.Release()
+		e.gridSlots[slot].readEvt = nil
+		e.gridSlots[slot].busy = false
+	}
+
 	if err := e.gridKernel.SetArgs(
 		e.targetBuffer,
 		e.currentBuffer,
 		e.maskBuffer,
-		e.errorGridBuf,
+		e.errorGridBufs[slot],
 		int32(e.width),
 		int32(e.height),
 		int32(e.gridW),
 		int32(e.gridH),
 	); err != nil {
+		return GridTicket{}, err
+	}
+	kernelEvt, err := e.queue.EnqueueNDRangeKernel(e.gridKernel, nil, []int{e.gridW, e.gridH}, nil, nil)
+	if err != nil {
+		return GridTicket{}, err
+	}
+	kernelEvt.Release()
+
+	readEvt, err := e.queue.EnqueueReadBufferFloat32(e.errorGridBufs[slot], false, 0, e.hostErrorGrids[slot], nil)
+	if err != nil {
+		return GridTicket{}, err
+	}
+
+	e.gridSeq++
+	e.gridSlots[slot] = gridSlot{
+		readEvt: readEvt,
+		seq:     e.gridSeq,
+		busy:    true,
+	}
+	return GridTicket{slot: slot, seq: e.gridSeq, valid: true}, nil
+}
+
+// WaitErrorGrid blocks until the given submission's grid readback finishes
+// and returns a copy of the grid plus its dimensions.
+func (e *Evaluator) WaitErrorGrid(t GridTicket) ([]float32, int, int, error) {
+	if !t.valid {
+		return nil, 0, 0, fmt.Errorf("WaitErrorGrid: invalid ticket")
+	}
+	s := &e.gridSlots[t.slot]
+	if !s.busy || s.seq != t.seq {
+		return nil, 0, 0, fmt.Errorf("WaitErrorGrid: stale or invalid ticket")
+	}
+	if err := cl.WaitForEvents([]*cl.Event{s.readEvt}); err != nil {
 		return nil, 0, 0, err
 	}
-	globalSize := []int{e.gridW, e.gridH}
-	if _, err := e.queue.EnqueueNDRangeKernel(e.gridKernel, nil, globalSize, nil, nil); err != nil {
-		return nil, 0, 0, err
-	}
-	if _, err := e.queue.EnqueueReadBufferFloat32(e.errorGridBuf, true, 0, e.hostErrorGrid, nil); err != nil {
-		return nil, 0, 0, err
-	}
-	out := make([]float32, len(e.hostErrorGrid))
-	copy(out, e.hostErrorGrid)
+	s.readEvt.Release()
+	s.readEvt = nil
+	s.busy = false
+	out := make([]float32, len(e.hostErrorGrids[t.slot]))
+	copy(out, e.hostErrorGrids[t.slot])
 	return out, e.gridW, e.gridH, nil
+}
+
+// ErrorGrid is the synchronous helper retained for callers that don't
+// care about overlap.
+func (e *Evaluator) ErrorGrid() ([]float32, int, int, error) {
+	t, err := e.SubmitErrorGrid()
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return e.WaitErrorGrid(t)
+}
+
+// ReadCurrent reads the entire current canvas back to host memory. The
+// blocking read goes through the same in-order queue as everything else,
+// so it serializes naturally after any pending apply / grid commands
+// without us having to drain the queue (which would invalidate any
+// outstanding GridTicket the caller is still holding).
+func (e *Evaluator) ReadCurrent(dst []float32) error {
+	if len(dst) != e.pixelCount*4 {
+		return fmt.Errorf("destination length mismatch")
+	}
+	evt, err := e.queue.EnqueueReadBufferFloat32(e.currentBuffer, true, 0, dst, nil)
+	if evt != nil {
+		evt.Release()
+	}
+	return err
 }
 
 // GridDims returns the dimensions of the error histogram grid.

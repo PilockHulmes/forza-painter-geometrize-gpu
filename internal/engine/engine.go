@@ -28,6 +28,15 @@ type Options struct {
 const (
 	maxNoImproveRetries = 100
 	minImproveDelta     = -1e-7
+
+	// Hill climb tuning. The mutation budget from settings is split into
+	// up to maxHillClimbRounds rounds; each round mutates the current best
+	// shape geometry slightly, evaluates the batch on GPU, and keeps any
+	// improvement before starting the next round. This is the standard
+	// geometrize-style hill climb adapted to GPU-friendly batches.
+	maxHillClimbRounds  = 32
+	idealHillClimbBatch = 64
+	minHillClimbRounds  = 1
 )
 
 func Run(opts Options) error {
@@ -68,11 +77,22 @@ func Run(opts Options) error {
 
 	shapes := []model.Shape{backgroundShape(prepared, normalizeScore(currentError, denom))}
 
+	moveStep, radiusStep := mutationSteps(prepared.Width, prepared.Height)
+
+	hillClimbRounds, mutationsPerRound := planHillClimb(cfg.MutatedSamples)
+
+	sampler, err := refreshSampler(evaluator, prepared)
+	if err != nil {
+		return err
+	}
+
 	fmt.Printf("Loaded image: %s (%dx%d), transparency=%v\n", opts.ImagePath, prepared.Width, prepared.Height, prepared.HasTransparency)
 	fmt.Printf("Settings: stopAt=%d randomSamples=%d mutatedSamples=%d saveAt=%d saveEvery(preview)=%d\n",
 		cfg.StopAt, cfg.RandomSamples, cfg.MutatedSamples, len(cfg.SaveAt), cfg.SaveEvery)
 	fmt.Printf("Compatibility mode: forceOpaqueShapes=%v\n", cfg.ForceOpaqueShapes)
-	fmt.Println("Scoring mode: delta error (negative = better, positive = worse)")
+	fmt.Printf("Hill climb: %d rounds x %d mutations (move +/- %.1fpx, radius +/- %.1fpx, theta +/- 30deg)\n",
+		hillClimbRounds, mutationsPerRound, moveStep, radiusStep)
+	fmt.Println("Scoring mode: delta error with GPU-computed optimal color (negative = better)")
 
 	acceptedShapes := 0
 	consecutiveNoImprove := 0
@@ -81,7 +101,7 @@ func Run(opts Options) error {
 		step := acceptedShapes + 1
 		stepStart := time.Now()
 		fmt.Printf("[%d/%d] Generating random samples (%d)...\n", step, cfg.StopAt, cfg.RandomSamples)
-		randomCands := randomCandidates(rng, prepared, cfg.RandomSamples, cfg.ForceOpaqueShapes)
+		randomCands := randomCandidates(rng, prepared, cfg.RandomSamples, cfg.ForceOpaqueShapes, sampler)
 		fmt.Printf("[%d/%d] Evaluating random sample batch on OpenCL (%d)...\n", step, cfg.StopAt, len(randomCands))
 		best, bestScore, err := evaluateBest(evaluator, randomCands)
 		if err != nil {
@@ -89,21 +109,22 @@ func Run(opts Options) error {
 		}
 		fmt.Printf("[%d/%d] Random best delta: %.6f\n", step, cfg.StopAt, bestScore)
 
-		if cfg.MutatedSamples > 0 {
-			fmt.Printf("[%d/%d] Generating mutated samples (%d)...\n", step, cfg.StopAt, cfg.MutatedSamples)
-			mutations := mutatedCandidates(rng, prepared, best, cfg.MutatedSamples, cfg.ForceOpaqueShapes)
-			fmt.Printf("[%d/%d] Evaluating mutated sample batch on OpenCL (%d)...\n", step, cfg.StopAt, len(mutations))
-			mutBest, mutScore, mutErr := evaluateBest(evaluator, mutations)
-			if mutErr != nil {
-				return mutErr
+		if hillClimbRounds > 0 && mutationsPerRound > 0 && bestScore < 0 {
+			improved := 0
+			for round := 0; round < hillClimbRounds; round++ {
+				mutations := mutatedCandidates(rng, prepared, best, mutationsPerRound, cfg.ForceOpaqueShapes, moveStep, radiusStep)
+				roundBest, roundScore, mutErr := evaluateBest(evaluator, mutations)
+				if mutErr != nil {
+					return mutErr
+				}
+				if roundScore < bestScore {
+					bestScore = roundScore
+					best = roundBest
+					improved++
+				}
 			}
-			if mutScore < bestScore {
-				fmt.Printf("[%d/%d] Mutation improved delta: %.6f -> %.6f\n", step, cfg.StopAt, bestScore, mutScore)
-				bestScore = mutScore
-				best = mutBest
-			} else {
-				fmt.Printf("[%d/%d] Mutation did not improve delta (best remains %.6f)\n", step, cfg.StopAt, bestScore)
-			}
+			fmt.Printf("[%d/%d] Hill climb best delta after %d rounds: %.6f (%d improvement(s))\n",
+				step, cfg.StopAt, hillClimbRounds, bestScore, improved)
 		}
 
 		if bestScore >= minImproveDelta {
@@ -118,16 +139,28 @@ func Run(opts Options) error {
 
 		consecutiveNoImprove = 0
 
-		if err := evaluator.Apply(best); err != nil {
+		// Quantize geometry + colour to the integer grid that will end up in
+		// the JSON; apply that exact shape so the GPU canvas matches what the
+		// game will render from the JSON later.
+		final := quantizeCandidate(best, prepared.Width, prepared.Height, cfg.ForceOpaqueShapes)
+
+		if err := evaluator.Apply(final); err != nil {
 			return err
 		}
 		currentError += float64(bestScore)
 		if currentError < 0 {
 			currentError = 0
 		}
-		shapes = append(shapes, toShape(best, normalizeScore(currentError, denom)))
+		shapes = append(shapes, toShape(final, normalizeScore(currentError, denom)))
 		acceptedShapes++
 		fmt.Printf("[%d/%d] Added rotated ellipse #%d (delta %.6f)\n", acceptedShapes, cfg.StopAt, len(shapes)-1, bestScore)
+
+		// Refresh the error histogram for biased sampling on the next step.
+		newSampler, sErr := refreshSampler(evaluator, prepared)
+		if sErr != nil {
+			return sErr
+		}
+		sampler = newSampler
 
 		if shouldSave(acceptedShapes, cfg) {
 			if err := saveShapes(opts, shapes, acceptedShapes); err != nil {
@@ -185,71 +218,196 @@ func backgroundShape(p *imageutil.PreparedImage, score float64) model.Shape {
 	}
 }
 
-func randomCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, count int, forceOpaque bool) []model.Candidate {
+// planHillClimb splits the configured mutation budget into a number of
+// rounds and a per-round batch size. Each round will be a single GPU
+// dispatch and the best shape from that dispatch becomes the seed of the
+// next round (real hill climbing). We aim for ~64 candidates per round to
+// keep the GPU occupied while still giving the climb enough steps to walk
+// uphill instead of just sampling around the random seed.
+func planHillClimb(budget int) (rounds, perRound int) {
+	if budget <= 0 {
+		return 0, 0
+	}
+	rounds = budget / idealHillClimbBatch
+	if rounds < minHillClimbRounds {
+		rounds = minHillClimbRounds
+	}
+	if rounds > maxHillClimbRounds {
+		rounds = maxHillClimbRounds
+	}
+	perRound = budget / rounds
+	if perRound < 1 {
+		perRound = 1
+	}
+	return rounds, perRound
+}
+
+func mutationSteps(width, height int) (move, radius float32) {
+	diag := math.Sqrt(float64(width*width) + float64(height*height))
+	move = float32(math.Max(2.0, diag*0.012))
+	radius = float32(math.Max(2.0, diag*0.010))
+	return move, radius
+}
+
+// errorSampler converts the GPU-produced error histogram into a CDF that
+// can be sampled in O(log n) per draw. It is rebuilt every accepted shape.
+type errorSampler struct {
+	gridW, gridH int
+	imgW, imgH   int
+	cdf          []float64
+	total        float64
+}
+
+func newErrorSampler(grid []float32, gridW, gridH, imgW, imgH int) *errorSampler {
+	cdf := make([]float64, len(grid))
+	var total float64
+	for i, v := range grid {
+		if v < 0 {
+			v = 0
+		}
+		total += float64(v)
+		cdf[i] = total
+	}
+	return &errorSampler{
+		gridW: gridW,
+		gridH: gridH,
+		imgW:  imgW,
+		imgH:  imgH,
+		cdf:   cdf,
+		total: total,
+	}
+}
+
+func (s *errorSampler) sample(rng *rand.Rand) (float32, float32) {
+	if s == nil || s.total <= 0 || s.gridW <= 0 || s.gridH <= 0 {
+		return rng.Float32() * float32(s.imgW), rng.Float32() * float32(s.imgH)
+	}
+	u := rng.Float64() * s.total
+	lo, hi := 0, len(s.cdf)-1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if s.cdf[mid] < u {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	cell := lo
+	gx := cell % s.gridW
+	gy := cell / s.gridW
+	x0 := int(int64(gx) * int64(s.imgW) / int64(s.gridW))
+	x1 := int(int64(gx+1) * int64(s.imgW) / int64(s.gridW))
+	y0 := int(int64(gy) * int64(s.imgH) / int64(s.gridH))
+	y1 := int(int64(gy+1) * int64(s.imgH) / int64(s.gridH))
+	if x1 <= x0 {
+		x1 = x0 + 1
+	}
+	if y1 <= y0 {
+		y1 = y0 + 1
+	}
+	if x1 > s.imgW {
+		x1 = s.imgW
+	}
+	if y1 > s.imgH {
+		y1 = s.imgH
+	}
+	x := float32(x0) + rng.Float32()*float32(x1-x0)
+	y := float32(y0) + rng.Float32()*float32(y1-y0)
+	return x, y
+}
+
+func refreshSampler(evaluator *gpu.Evaluator, prepared *imageutil.PreparedImage) (*errorSampler, error) {
+	grid, gw, gh, err := evaluator.ErrorGrid()
+	if err != nil {
+		return nil, err
+	}
+	return newErrorSampler(grid, gw, gh, prepared.Width, prepared.Height), nil
+}
+
+// randomCandidates seeds candidates whose CENTER is biased towards the
+// regions of the image that still have the most error. Geometry (radius,
+// angle) is randomized; color is left zero because the GPU evaluator
+// computes the optimal color analytically and writes it back in the
+// EvalResult.
+func randomCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, count int, forceOpaque bool, sampler *errorSampler) []model.Candidate {
 	out := make([]model.Candidate, 0, count)
 	w := float32(prepared.Width)
 	h := float32(prepared.Height)
-	maxRadius := float32(math.Max(float64(prepared.Width), float64(prepared.Height))) * 0.35
-	minRadius := float32(1)
-	maxAttempts := count * 30
+	diag := float32(math.Sqrt(float64(prepared.Width*prepared.Width) + float64(prepared.Height*prepared.Height)))
+	maxRadius := diag * 0.25
+	if maxRadius < 4 {
+		maxRadius = 4
+	}
+	minRadius := float32(2)
+	maxAttempts := count * 4
 	attempts := 0
 
 	for len(out) < count && attempts < maxAttempts {
 		attempts++
-		x := rng.Float32() * w
-		y := rng.Float32() * h
-		if prepared.OpaqueMask[int(y)*prepared.Width+int(x)] == 0 {
-			continue
+		x, y := sampler.sample(rng)
+		if x < 0 {
+			x = 0
 		}
-		ci := (int(y)*prepared.Width + int(x)) * 4
-		alpha := prepared.Target[ci+3]
-		if alpha < 0.05 {
-			continue
+		if y < 0 {
+			y = 0
 		}
-		candAlpha := randRange(rng, 0.2, 1.0) * alpha
-		if forceOpaque {
-			candAlpha = 1.0
+		if x > w-1 {
+			x = w - 1
 		}
-		cand := model.Candidate{
+		if y > h-1 {
+			y = h - 1
+		}
+		alpha := float32(1.0)
+		if !forceOpaque {
+			alpha = randRange(rng, 0.3, 1.0)
+		}
+		out = append(out, model.Candidate{
 			X:     x,
 			Y:     y,
 			RX:    randRange(rng, minRadius, maxRadius),
 			RY:    randRange(rng, minRadius, maxRadius),
 			Theta: rng.Float32() * 360,
-			R:     prepared.Target[ci+0],
-			G:     prepared.Target[ci+1],
-			B:     prepared.Target[ci+2],
-			A:     candAlpha,
-		}
-		out = append(out, quantizeCandidate(cand, prepared.Width, prepared.Height))
+			A:     alpha,
+		})
 	}
 	if len(out) == 0 {
-		out = append(out, quantizeCandidate(model.Candidate{
+		out = append(out, model.Candidate{
 			X:     w * 0.5,
 			Y:     h * 0.5,
 			RX:    maxRadius * 0.25,
 			RY:    maxRadius * 0.25,
 			Theta: 0,
-			R:     0,
-			G:     0,
-			B:     0,
-			A:     0,
-		}, prepared.Width, prepared.Height))
+			A:     1.0,
+		})
 	}
 	return out
 }
 
-func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base model.Candidate, count int, forceOpaque bool) []model.Candidate {
+// mutatedCandidates only perturbs geometry. Colors are recomputed by the
+// GPU on each evaluation, so seeding them on the CPU side would be wasted
+// work (and would constrain the search).
+func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base model.Candidate, count int, forceOpaque bool, moveStep, radiusStep float32) []model.Candidate {
 	out := make([]model.Candidate, 0, count)
-	maxAttempts := count * 40
-	attempts := 0
-	for len(out) < count && attempts < maxAttempts {
-		attempts++
+	w := float32(prepared.Width)
+	h := float32(prepared.Height)
+	for i := 0; i < count; i++ {
 		cand := base
-		cand.X += randRange(rng, -12, 12)
-		cand.Y += randRange(rng, -12, 12)
-		cand.RX = float32(math.Max(1, float64(cand.RX+randRange(rng, -8, 8))))
-		cand.RY = float32(math.Max(1, float64(cand.RY+randRange(rng, -8, 8))))
+		cand.X += randRange(rng, -moveStep, moveStep)
+		cand.Y += randRange(rng, -moveStep, moveStep)
+		if cand.X < 0 {
+			cand.X = 0
+		}
+		if cand.Y < 0 {
+			cand.Y = 0
+		}
+		if cand.X > w-1 {
+			cand.X = w - 1
+		}
+		if cand.Y > h-1 {
+			cand.Y = h - 1
+		}
+		cand.RX = float32(math.Max(1, float64(cand.RX+randRange(rng, -radiusStep, radiusStep))))
+		cand.RY = float32(math.Max(1, float64(cand.RY+randRange(rng, -radiusStep, radiusStep))))
 		cand.Theta += randRange(rng, -30, 30)
 		if cand.Theta < 0 {
 			cand.Theta += 360
@@ -257,24 +415,10 @@ func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base m
 		if cand.Theta >= 360 {
 			cand.Theta -= 360
 		}
-
-		if cand.X < 0 || cand.Y < 0 || int(cand.X) >= prepared.Width || int(cand.Y) >= prepared.Height {
-			continue
-		}
-		if prepared.OpaqueMask[int(cand.Y)*prepared.Width+int(cand.X)] == 0 {
-			continue
-		}
-
-		ci := (int(cand.Y)*prepared.Width + int(cand.X)) * 4
-		cand.R = clamp01(prepared.Target[ci+0] + randRange(rng, -0.08, 0.08))
-		cand.G = clamp01(prepared.Target[ci+1] + randRange(rng, -0.08, 0.08))
-		cand.B = clamp01(prepared.Target[ci+2] + randRange(rng, -0.08, 0.08))
 		if forceOpaque {
 			cand.A = 1.0
-		} else {
-			cand.A = clamp01(base.A + randRange(rng, -0.15, 0.15))
 		}
-		out = append(out, quantizeCandidate(cand, prepared.Width, prepared.Height))
+		out = append(out, cand)
 	}
 	if len(out) == 0 {
 		out = append(out, base)
@@ -282,23 +426,30 @@ func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base m
 	return out
 }
 
+// evaluateBest dispatches the batch on the GPU, picks the lowest-score
+// candidate and merges the GPU-computed optimal color into it so that
+// subsequent hill-climb rounds work from the correct base color.
 func evaluateBest(e *gpu.Evaluator, cands []model.Candidate) (model.Candidate, float32, error) {
-	scores, err := e.Evaluate(cands)
+	results, err := e.Evaluate(cands)
 	if err != nil {
 		return model.Candidate{}, 0, err
 	}
-	if len(scores) == 0 {
+	if len(results) == 0 {
 		return model.Candidate{}, 0, fmt.Errorf("no candidate scores returned")
 	}
 	bestIdx := 0
-	bestScore := scores[0]
-	for i := 1; i < len(scores); i++ {
-		if scores[i] < bestScore {
-			bestScore = scores[i]
+	bestScore := results[0].Score
+	for i := 1; i < len(results); i++ {
+		if results[i].Score < bestScore {
+			bestScore = results[i].Score
 			bestIdx = i
 		}
 	}
-	return cands[bestIdx], bestScore, nil
+	best := cands[bestIdx]
+	best.R = results[bestIdx].R
+	best.G = results[bestIdx].G
+	best.B = results[bestIdx].B
+	return best, bestScore, nil
 }
 
 func toShape(c model.Candidate, score float64) model.Shape {
@@ -365,16 +516,6 @@ func randRange(rng *rand.Rand, minV, maxV float32) float32 {
 	return minV + (maxV-minV)*rng.Float32()
 }
 
-func clamp01(v float32) float32 {
-	if v < 0 {
-		return 0
-	}
-	if v > 1 {
-		return 1
-	}
-	return v
-}
-
 func savePreviewSnapshot(evaluator *gpu.Evaluator, opts Options, width, height, step int) error {
 	if opts.PreviewPath == "" {
 		return nil
@@ -424,7 +565,11 @@ func normalizeScore(totalError, denom float64) float64 {
 	return math.Round(value*1_000_000) / 1_000_000
 }
 
-func quantizeCandidate(c model.Candidate, width, height int) model.Candidate {
+// quantizeCandidate is now only invoked at acceptance time. The GPU search
+// runs on full-precision floats; the final shape that is committed both to
+// the canvas and to the JSON gets snapped to the integer grid the game
+// expects (pixel positions, integer angle, 8-bit colour).
+func quantizeCandidate(c model.Candidate, width, height int, forceOpaque bool) model.Candidate {
 	c.X = float32(clampInt(int(math.Round(float64(c.X))), 0, maxInt(0, width-1)))
 	c.Y = float32(clampInt(int(math.Round(float64(c.Y))), 0, maxInt(0, height-1)))
 	c.RX = float32(maxInt(1, int(math.Round(float64(c.RX)))))
@@ -439,6 +584,9 @@ func quantizeCandidate(c model.Candidate, width, height int) model.Candidate {
 	}
 	c.Theta = float32(angle)
 
+	if forceOpaque {
+		c.A = 1.0
+	}
 	c.R = float32(f32ToByte(c.R)) / 255.0
 	c.G = float32(f32ToByte(c.G)) / 255.0
 	c.B = float32(f32ToByte(c.B)) / 255.0

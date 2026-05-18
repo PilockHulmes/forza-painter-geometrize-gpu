@@ -30,11 +30,13 @@ package gpu
 //   Output per candidate: 4 floats { score, R, G, B }. Score is summed
 //   over inside pixels (negative = better). Opaque pixels feed the
 //   optimal-color statistics; transparent pixels inside the ellipse are
-//   counted separately and add a penalty α²·(1+oR²+oG²+oB²) per pixel
-//   (modeling the fact that the FH6 renderer will paint those pixels
-//   even though our internal canvas masks them). This biases candidates
-//   to stay inside the silhouette but still allows useful overhang. A
-//   candidate that does not cover any opaque pixel is rejected (+Inf).
+//   counted separately as Nt. Because the FH6 in-game renderer ignores
+//   our alpha mask and paints the *full* ellipse, any shape that
+//   extends into the transparent region produces a visible halo against
+//   whatever body colour the user picked. We therefore HARD REJECT
+//   candidates whose overhang exceeds a small tolerance (Nt*20 > N,
+//   i.e. >~5% of inside pixels are transparent). The tolerance keeps
+//   anti-aliased silhouette edges usable.
 //
 // apply_candidate_v2:
 //   Blends a chosen shape into the current canvas. Operates on a tight
@@ -130,8 +132,12 @@ __kernel void evaluate_candidates_v3(
         }
     }
 
-    if (N == 0) {
-        // Shape doesn't cover any opaque pixel; reject hard.
+    // Hard reject:
+    //   - shapes covering no opaque pixel at all
+    //   - shapes whose transparent overhang exceeds ~5% of inside area
+    // The 20*Nt > N test is equivalent to Nt/(N+Nt) > ~4.76%.
+    // TODO: canary build test 1% inside area to anti overhang
+    if (N == 0 || Nt * 100 > N) {
         results[gid * 4 + 0] = 3.402823466e+38f;
         results[gid * 4 + 1] = 0.0f;
         results[gid * 4 + 2] = 0.0f;
@@ -169,12 +175,10 @@ __kernel void evaluate_candidates_v3(
 
     float totalDelta = dR + dG + dB + dA;
 
-    // Transparent-pixel penalty: each transparent pixel inside the
-    // ellipse will be painted by the FH6 renderer with colour
-    // (oR,oG,oB,α) over a transparent target (0,0,0,0), contributing
-    // α²·(oR² + oG² + oB² + 1) to the *visible* squared error even
-    // though our masked Apply skips it. Adding it here pushes shapes
-    // back inside the silhouette without hard-rejecting overhang.
+    // Soft penalty within the tolerance budget: each remaining
+    // transparent pixel still adds α²·(1+oR²+oG²+oB²) so that the
+    // optimiser prefers zero overhang over allowed overhang when the
+    // opaque-side error is otherwise tied.
     if (Nt > 0) {
         float penalty = a2 * ((float)Nt) * (oR*oR + oG*oG + oB*oB + 1.0f);
         totalDelta += penalty;

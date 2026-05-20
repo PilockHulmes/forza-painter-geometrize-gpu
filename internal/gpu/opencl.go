@@ -410,12 +410,13 @@ func (e *Evaluator) SubmitEval(cands []model.Candidate) (EvalTicket, error) {
 
 	if e.evalSlots[slot].busy {
 		// Engine forgot to consume an outstanding ticket; reclaim the slot.
-		if err := cl.WaitForEvents([]*cl.Event{e.evalSlots[slot].readEvt}); err != nil {
-			return EvalTicket{}, err
-		}
+		err := cl.WaitForEvents([]*cl.Event{e.evalSlots[slot].readEvt})
 		e.evalSlots[slot].readEvt.Release()
 		e.evalSlots[slot].readEvt = nil
 		e.evalSlots[slot].busy = false
+		if err != nil {
+			return EvalTicket{}, err
+		}
 	}
 
 	packed := e.hostCands[slot][:count*6]
@@ -486,12 +487,13 @@ func (e *Evaluator) WaitEval(t EvalTicket) ([]EvalResult, error) {
 	if !s.busy || s.seq != t.seq {
 		return nil, fmt.Errorf("WaitEval: stale or invalid ticket")
 	}
-	if err := cl.WaitForEvents([]*cl.Event{s.readEvt}); err != nil {
-		return nil, err
-	}
+	err := cl.WaitForEvents([]*cl.Event{s.readEvt})
 	s.readEvt.Release()
 	s.readEvt = nil
 	s.busy = false
+	if err != nil {
+		return nil, err
+	}
 
 	flat := e.hostResults[t.slot][:t.count*4]
 	out := make([]EvalResult, t.count)
@@ -611,12 +613,13 @@ func (e *Evaluator) SubmitErrorGrid() (GridTicket, error) {
 	e.nextGridSlot = (e.nextGridSlot + 1) % ringSize
 
 	if e.gridSlots[slot].busy {
-		if err := cl.WaitForEvents([]*cl.Event{e.gridSlots[slot].readEvt}); err != nil {
-			return GridTicket{}, err
-		}
+		err := cl.WaitForEvents([]*cl.Event{e.gridSlots[slot].readEvt})
 		e.gridSlots[slot].readEvt.Release()
 		e.gridSlots[slot].readEvt = nil
 		e.gridSlots[slot].busy = false
+		if err != nil {
+			return GridTicket{}, err
+		}
 	}
 
 	if err := e.gridKernel.SetArgs(
@@ -661,12 +664,13 @@ func (e *Evaluator) WaitErrorGrid(t GridTicket) ([]float32, int, int, error) {
 	if !s.busy || s.seq != t.seq {
 		return nil, 0, 0, fmt.Errorf("WaitErrorGrid: stale or invalid ticket")
 	}
-	if err := cl.WaitForEvents([]*cl.Event{s.readEvt}); err != nil {
-		return nil, 0, 0, err
-	}
+	err := cl.WaitForEvents([]*cl.Event{s.readEvt})
 	s.readEvt.Release()
 	s.readEvt = nil
 	s.busy = false
+	if err != nil {
+		return nil, 0, 0, err
+	}
 	out := make([]float32, len(e.hostErrorGrids[t.slot]))
 	copy(out, e.hostErrorGrids[t.slot])
 	return out, e.gridW, e.gridH, nil

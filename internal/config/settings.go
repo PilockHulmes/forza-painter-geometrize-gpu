@@ -25,6 +25,7 @@ func DefaultSettings() model.Settings {
 		SaveAt:            map[int]struct{}{500: {}, 1000: {}, 1500: {}, 2000: {}, 2500: {}, 3000: {}},
 		SaveEvery:         10,
 		StopAt:            3000,
+		UseWorkGroupEval:  true,
 	}
 }
 
@@ -101,6 +102,8 @@ func ParseSettings(path string) (model.Settings, error) {
 			cfg.SaveEvery = parseInt(value, cfg.SaveEvery)
 		case "stopAt":
 			cfg.StopAt = parseInt(value, cfg.StopAt)
+		case "useWorkGroupEval":
+			cfg.UseWorkGroupEval = parseBool(value, cfg.UseWorkGroupEval)
 		}
 	}
 	if err := scanner.Err(); err != nil {

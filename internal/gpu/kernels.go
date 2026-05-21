@@ -190,6 +190,181 @@ __kernel void evaluate_candidates_v3(
     results[gid * 4 + 3] = oB;
 }
 
+// evaluate_candidates_v4 (work-group reduction):
+//   Same analytic single-pass algorithm as v3, but the bounding-box
+//   traversal is split across a 256-work-item group (16×16). Each
+//   work-item strides through the bbox independently, accumulating
+//   partial statistics in registers, then writes them to local memory.
+//   An O(log₂ N) tree reduction merges the partials so that only
+//   work-item 0 writes the final result. For large bboxes this cuts
+//   per-work-item pixel visits from ~160k down to ~600, reducing
+//   register pressure and improving occupancy.
+//
+//   Local memory budget: 256 work-items × 18 floats = 18.4 KB, well
+//   within typical 32–64 KB per-work-group limits.
+#define WG_SIZE 256
+
+__kernel void evaluate_candidates_v4(
+    __global const float4* target,
+    __global const float4* current,
+    __global const uchar* opaqueMask,
+    __global const float* candidates,
+    __global float* results,
+    const int width,
+    const int height
+) {
+    int gid = get_group_id(0);   // candidate index
+    int lid = get_local_id(1) * get_local_size(0) + get_local_id(0); // 0..255
+
+    int base = gid * 6;
+    float cx = candidates[base + 0];
+    float cy = candidates[base + 1];
+    float rx = fmax(candidates[base + 2], 1.0f);
+    float ry = fmax(candidates[base + 3], 1.0f);
+    float thetaDeg = candidates[base + 4];
+    float ca = clamp(candidates[base + 5], 1e-3f, 1.0f);
+
+    float theta = thetaDeg * 0.01745329251994329577f;
+    float cosT = cos(theta);
+    float sinT = sin(theta);
+    float invRX2 = 1.0f / (rx * rx);
+    float invRY2 = 1.0f / (ry * ry);
+
+    float rx2 = rx * rx;
+    float ry2 = ry * ry;
+    float cos2 = cosT * cosT;
+    float sin2 = sinT * sinT;
+    float ex = sqrt(rx2 * cos2 + ry2 * sin2);
+    float ey = sqrt(rx2 * sin2 + ry2 * cos2);
+
+    int xMin = (int)floor(cx - ex - 1.0f);
+    int xMax = (int)ceil(cx + ex + 1.0f);
+    int yMin = (int)floor(cy - ey - 1.0f);
+    int yMax = (int)ceil(cy + ey + 1.0f);
+
+    xMin = max(0, xMin);
+    yMin = max(0, yMin);
+    xMax = min(width - 1, xMax);
+    yMax = min(height - 1, yMax);
+
+    int bw = max(xMax - xMin + 1, 1);
+    int totalCells = bw * max(yMax - yMin + 1, 1);
+
+    int N = 0, Nt = 0;
+    float sTR = 0.0f, sTG = 0.0f, sTB = 0.0f, sTA = 0.0f;
+    float sCR = 0.0f, sCG = 0.0f, sCB = 0.0f, sCA = 0.0f;
+    float sCR2 = 0.0f, sCG2 = 0.0f, sCB2 = 0.0f, sCA2 = 0.0f;
+    float sTCR = 0.0f, sTCG = 0.0f, sTCB = 0.0f, sTCA = 0.0f;
+
+    for (int ci = lid; ci < totalCells; ci += WG_SIZE) {
+        int ly = ci / bw;
+        int lx = ci % bw;
+        int x = xMin + lx;
+        int y = yMin + ly;
+
+        float dx = ((float)x + 0.5f) - cx;
+        float dy = ((float)y + 0.5f) - cy;
+        float xr = dx * cosT + dy * sinT;
+        float yr = -dx * sinT + dy * cosT;
+        if (xr * xr * invRX2 + yr * yr * invRY2 > 1.0f) {
+            continue;
+        }
+        int p = y * width + x;
+        if (opaqueMask[p] == 0) {
+            Nt++;
+            continue;
+        }
+
+        float4 t = target[p];
+        float4 s = current[p];
+
+        sTR += t.x; sTG += t.y; sTB += t.z; sTA += t.w;
+        sCR += s.x; sCG += s.y; sCB += s.z; sCA += s.w;
+        sCR2 += s.x * s.x; sCG2 += s.y * s.y;
+        sCB2 += s.z * s.z; sCA2 += s.w * s.w;
+        sTCR += t.x * s.x; sTCG += t.y * s.y;
+        sTCB += t.z * s.z; sTCA += t.w * s.w;
+        N++;
+    }
+
+    // Write partials to local memory (flat, 18 floats per work-item).
+    __local float l_data[WG_SIZE * 18];
+    int off = lid * 18;
+    l_data[off +  0] = (float)N;  l_data[off +  1] = (float)Nt;
+    l_data[off +  2] = sTR;       l_data[off +  3] = sTG;
+    l_data[off +  4] = sTB;       l_data[off +  5] = sTA;
+    l_data[off +  6] = sCR;       l_data[off +  7] = sCG;
+    l_data[off +  8] = sCB;       l_data[off +  9] = sCA;
+    l_data[off + 10] = sCR2;      l_data[off + 11] = sCG2;
+    l_data[off + 12] = sCB2;      l_data[off + 13] = sCA2;
+    l_data[off + 14] = sTCR;      l_data[off + 15] = sTCG;
+    l_data[off + 16] = sTCB;      l_data[off + 17] = sTCA;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Tree reduction: log2(256) = 8 rounds.
+    for (int stride = WG_SIZE / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            int a = lid * 18;
+            int b = (lid + stride) * 18;
+            for (int k = 0; k < 18; k++) {
+                l_data[a + k] += l_data[b + k];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // Only work-item 0 writes the final result for this candidate.
+    if (lid != 0) {
+        return;
+    }
+
+    N  = (int)l_data[0];   Nt = (int)l_data[1];
+    sTR = l_data[2];  sTG = l_data[3];  sTB = l_data[4];  sTA = l_data[5];
+    sCR = l_data[6];  sCG = l_data[7];  sCB = l_data[8];  sCA = l_data[9];
+    sCR2= l_data[10]; sCG2= l_data[11]; sCB2= l_data[12]; sCA2= l_data[13];
+    sTCR= l_data[14]; sTCG= l_data[15]; sTCB= l_data[16]; sTCA= l_data[17];
+
+    // Hard reject (same thresholds as v3).
+    if (N == 0 || Nt * 100 > N) {
+        results[gid * 4 + 0] = 3.402823466e+38f;
+        results[gid * 4 + 1] = 0.0f;
+        results[gid * 4 + 2] = 0.0f;
+        results[gid * 4 + 3] = 0.0f;
+        return;
+    }
+
+    float Nf = (float)N;
+    float invN = 1.0f / Nf;
+    float invA = 1.0f - ca;
+
+    float oR = clamp((sTR * invN - (sCR * invN) * invA) / ca, 0.0f, 1.0f);
+    float oG = clamp((sTG * invN - (sCG * invN) * invA) / ca, 0.0f, 1.0f);
+    float oB = clamp((sTB * invN - (sCB * invN) * invA) / ca, 0.0f, 1.0f);
+
+    float a2 = ca * ca;
+    float two_a = 2.0f * ca;
+
+    float dR = a2 * (Nf*oR*oR - 2.0f*oR*sCR + sCR2)
+             - two_a * (oR*sTR - oR*sCR - sTCR + sCR2);
+    float dG = a2 * (Nf*oG*oG - 2.0f*oG*sCG + sCG2)
+             - two_a * (oG*sTG - oG*sCG - sTCG + sCG2);
+    float dB = a2 * (Nf*oB*oB - 2.0f*oB*sCB + sCB2)
+             - two_a * (oB*sTB - oB*sCB - sTCB + sCB2);
+    float dA = a2 * (Nf - 2.0f*sCA + sCA2)
+             - two_a * (sTA - sCA - sTCA + sCA2);
+
+    float totalDelta = dR + dG + dB + dA;
+    if (Nt > 0) {
+        totalDelta += a2 * ((float)Nt) * (oR*oR + oG*oG + oB*oB + 1.0f);
+    }
+
+    results[gid * 4 + 0] = totalDelta;
+    results[gid * 4 + 1] = oR;
+    results[gid * 4 + 2] = oG;
+    results[gid * 4 + 3] = oB;
+}
+
 __kernel void apply_candidate_v2(
     __global float4* current,
     __global const uchar* opaqueMask,

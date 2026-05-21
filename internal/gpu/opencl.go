@@ -71,12 +71,18 @@ type gridSlot struct {
 }
 
 type Evaluator struct {
-	context     *cl.Context
-	queue       *cl.CommandQueue
-	program     *cl.Program
-	evalKernel  *cl.Kernel
-	applyKernel *cl.Kernel
-	gridKernel  *cl.Kernel
+	context      *cl.Context
+	queue        *cl.CommandQueue
+	program      *cl.Program
+	evalKernel   *cl.Kernel
+	evalKernelV4 *cl.Kernel
+	applyKernel  *cl.Kernel
+	gridKernel   *cl.Kernel
+
+	UseWorkGroupEval bool
+
+	// wgSize is the work-group size for evaluate_candidates_v4 (16×16).
+	wgSize int
 
 	targetBuffer  *cl.MemObject
 	currentBuffer *cl.MemObject
@@ -197,8 +203,17 @@ func NewEvaluator(target, current []float32, mask []uint8, width, height int, ma
 		ctx.Release()
 		return nil, err
 	}
+	evalKernelV4, err := program.CreateKernel("evaluate_candidates_v4")
+	if err != nil {
+		evalKernel.Release()
+		program.Release()
+		queue.Release()
+		ctx.Release()
+		return nil, err
+	}
 	applyKernel, err := program.CreateKernel("apply_candidate_v2")
 	if err != nil {
+		evalKernelV4.Release()
 		evalKernel.Release()
 		program.Release()
 		queue.Release()
@@ -208,6 +223,7 @@ func NewEvaluator(target, current []float32, mask []uint8, width, height int, ma
 	gridKernel, err := program.CreateKernel("compute_error_grid")
 	if err != nil {
 		applyKernel.Release()
+		evalKernelV4.Release()
 		evalKernel.Release()
 		program.Release()
 		queue.Release()
@@ -235,8 +251,10 @@ func NewEvaluator(target, current []float32, mask []uint8, width, height int, ma
 		queue:         queue,
 		program:       program,
 		evalKernel:    evalKernel,
+		evalKernelV4:  evalKernelV4,
 		applyKernel:   applyKernel,
 		gridKernel:    gridKernel,
+		wgSize:        16, // 16×16 = 256 work-items per group
 		width:         width,
 		height:        height,
 		pixelCount:    width * height,
@@ -268,6 +286,7 @@ func NewEvaluator(target, current []float32, mask []uint8, width, height int, ma
 		}
 		gridKernel.Release()
 		applyKernel.Release()
+		evalKernelV4.Release()
 		evalKernel.Release()
 		program.Release()
 		queue.Release()
@@ -371,6 +390,9 @@ func (e *Evaluator) Close() {
 	if e.applyKernel != nil {
 		e.applyKernel.Release()
 	}
+	if e.evalKernelV4 != nil {
+		e.evalKernelV4.Release()
+	}
 	if e.evalKernel != nil {
 		e.evalKernel.Release()
 	}
@@ -461,26 +483,47 @@ func (e *Evaluator) SubmitEval(cands []model.Candidate) (EvalTicket, error) {
 	}
 	writeEvt.Release()
 
-	if err := e.evalKernel.SetArgs(
-		e.targetBuffer,
-		e.currentBuffer,
-		e.maskBuffer,
-		e.candBuffers[slot],
-		e.resultBuffers[slot],
-		int32(e.width),
-		int32(e.height),
-	); err != nil {
-		return EvalTicket{}, err
+	if e.UseWorkGroupEval {
+		if err := e.evalKernelV4.SetArgs(
+			e.targetBuffer,
+			e.currentBuffer,
+			e.maskBuffer,
+			e.candBuffers[slot],
+			e.resultBuffers[slot],
+			int32(e.width),
+			int32(e.height),
+		); err != nil {
+			return EvalTicket{}, err
+		}
+		gs := e.wgSize
+		kernelEvt, err := e.queue.EnqueueNDRangeKernel(
+			e.evalKernelV4, nil,
+			[]int{count * gs, gs},
+			[]int{gs, gs},
+			nil,
+		)
+		if err != nil {
+			return EvalTicket{}, err
+		}
+		kernelEvt.Release()
+	} else {
+		if err := e.evalKernel.SetArgs(
+			e.targetBuffer,
+			e.currentBuffer,
+			e.maskBuffer,
+			e.candBuffers[slot],
+			e.resultBuffers[slot],
+			int32(e.width),
+			int32(e.height),
+		); err != nil {
+			return EvalTicket{}, err
+		}
+		kernelEvt, err := e.queue.EnqueueNDRangeKernel(e.evalKernel, nil, []int{count}, nil, nil)
+		if err != nil {
+			return EvalTicket{}, err
+		}
+		kernelEvt.Release()
 	}
-
-	// clEnqueueNDRangeKernel snapshots its arguments at enqueue time, so
-	// it is safe to set new args for a different slot in the next call
-	// even though this kernel hasn't actually executed yet.
-	kernelEvt, err := e.queue.EnqueueNDRangeKernel(e.evalKernel, nil, []int{count}, nil, nil)
-	if err != nil {
-		return EvalTicket{}, err
-	}
-	kernelEvt.Release()
 
 	flat := e.hostResults[slot][:count*4]
 	readEvt, err := e.queue.EnqueueReadBufferFloat32(e.resultBuffers[slot], false, 0, flat, nil)

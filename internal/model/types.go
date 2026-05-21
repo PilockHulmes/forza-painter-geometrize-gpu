@@ -13,6 +13,7 @@ type Settings struct {
 	SaveAt            map[int]struct{}
 	SaveEvery         int
 	StopAt            int
+	UseWorkGroupEval  bool
 }
 
 type Shape struct {

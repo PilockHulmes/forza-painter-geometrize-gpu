@@ -68,6 +68,7 @@ func Run(opts Options) error {
 	if err != nil {
 		return err
 	}
+	evaluator.UseWorkGroupEval = cfg.UseWorkGroupEval
 	defer evaluator.Close()
 
 	rng := rand.New(rand.NewSource(seedValue(opts.Seed)))

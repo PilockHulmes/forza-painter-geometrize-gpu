@@ -48,8 +48,12 @@ package gpu
 //   uses it to bias random candidate placement towards high-error
 //   regions.
 const evaluateKernelSource = `
+// Compile-time sampler for image2d reads. Nearest-neighbour with
+// clamp-to-edge avoids boundary artefacts.
+const sampler_t imgSampler = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_NEAREST;
+
 __kernel void evaluate_candidates_v3(
-    __global const float4* target,
+    __read_only image2d_t target,
     __global const float4* current,
     __global const uchar* opaqueMask,
     __global const float* candidates,
@@ -115,7 +119,7 @@ __kernel void evaluate_candidates_v3(
                 continue;
             }
 
-            float4 t = target[p];
+            float4 t = read_imagef(target, imgSampler, (int2)(x, y));
             float4 s = current[p];
 
             sTR += t.x; sTG += t.y; sTB += t.z; sTA += t.w;
@@ -205,7 +209,7 @@ __kernel void evaluate_candidates_v3(
 #define WG_SIZE 256
 
 __kernel void evaluate_candidates_v4(
-    __global const float4* target,
+    __read_only image2d_t target,
     __global const float4* current,
     __global const uchar* opaqueMask,
     __global const float* candidates,
@@ -275,7 +279,7 @@ __kernel void evaluate_candidates_v4(
             continue;
         }
 
-        float4 t = target[p];
+        float4 t = read_imagef(target, imgSampler, (int2)(x, y));
         float4 s = current[p];
 
         sTR += t.x; sTG += t.y; sTB += t.z; sTA += t.w;
@@ -425,7 +429,7 @@ __kernel void apply_candidate_v2(
 }
 
 __kernel void compute_error_grid(
-    __global const float4* target,
+    __read_only image2d_t target,
     __global const float4* current,
     __global const uchar* opaqueMask,
     __global float* gridOut,
@@ -453,7 +457,7 @@ __kernel void compute_error_grid(
             if (opaqueMask[p] == 0) {
                 continue;
             }
-            float4 t = target[p];
+            float4 t = read_imagef(target, imgSampler, (int2)(x, y));
             float4 s = current[p];
             float dr = t.x - s.x;
             float dg = t.y - s.y;

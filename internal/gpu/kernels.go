@@ -3,50 +3,53 @@ package gpu
 // evaluateKernelSource contains all OpenCL kernels used by the engine.
 //
 // evaluate_candidates_v3 (single-pass, analytic):
-//   For each candidate (cx, cy, rx, ry, thetaDeg, alpha) it computes the
-//   geometrize-style "optimal color" (alpha-weighted mean of the target
-//   minus current contribution inside the shape) and the resulting delta
-//   error if that shape were drawn over the current canvas.
 //
-//   Crucially this is done in a SINGLE pass over the bounding box. We
-//   accumulate per-channel statistics
-//     N    = inside pixel count
-//     Σs   = sum of current
-//     Σt   = sum of target
-//     Σs²  = sum of current squared
-//     Σst  = sum of current * target
-//   and then derive both the optimal RGB color AND the analytic delta
-//   error in O(1) post-loop work via the identity
+//	For each candidate (cx, cy, rx, ry, thetaDeg, alpha) it computes the
+//	geometrize-style "optimal color" (alpha-weighted mean of the target
+//	minus current contribution inside the shape) and the resulting delta
+//	error if that shape were drawn over the current canvas.
 //
-//     Σ ΔErr = α²·[N·c² − 2c·Σs + Σs²] − 2α·[c·Σt − c·Σs − Σst + Σs²]
+//	Crucially this is done in a SINGLE pass over the bounding box. We
+//	accumulate per-channel statistics
+//	  N    = inside pixel count
+//	  Σs   = sum of current
+//	  Σt   = sum of target
+//	  Σs²  = sum of current squared
+//	  Σst  = sum of current * target
+//	and then derive both the optimal RGB color AND the analytic delta
+//	error in O(1) post-loop work via the identity
 //
-//   which holds for any constant c summed over the ellipse. The alpha
-//   channel uses the same identity with c=1 (because out_a blends
-//   towards 1 weighted by α, not towards a free color parameter).
+//	  Σ ΔErr = α²·[N·c² − 2c·Σs + Σs²] − 2α·[c·Σt − c·Σs − Σst + Σs²]
 //
-//   Skipping the second bbox traversal halves the work-item runtime at
-//   the cost of ~17 extra register-resident accumulators per work-item.
+//	which holds for any constant c summed over the ellipse. The alpha
+//	channel uses the same identity with c=1 (because out_a blends
+//	towards 1 weighted by α, not towards a free color parameter).
 //
-//   Output per candidate: 4 floats { score, R, G, B }. Score is summed
-//   over inside pixels (negative = better). Opaque pixels feed the
-//   optimal-color statistics; transparent pixels inside the ellipse are
-//   counted separately as Nt. Because the FH6 in-game renderer ignores
-//   our alpha mask and paints the *full* ellipse, any shape that
-//   extends into the transparent region produces a visible halo against
-//   whatever body colour the user picked. We therefore HARD REJECT
-//   candidates whose overhang exceeds a small tolerance (Nt*20 > N,
-//   i.e. >~5% of inside pixels are transparent). The tolerance keeps
-//   anti-aliased silhouette edges usable.
+//	Skipping the second bbox traversal halves the work-item runtime at
+//	the cost of ~17 extra register-resident accumulators per work-item.
+//
+//	Output per candidate: 4 floats { score, R, G, B }. Score is summed
+//	over inside pixels (negative = better). Opaque pixels feed the
+//	optimal-color statistics; transparent pixels inside the ellipse are
+//	counted separately as Nt. Because the FH6 in-game renderer ignores
+//	our alpha mask and paints the *full* ellipse, any shape that
+//	extends into the transparent region produces a visible halo against
+//	whatever body colour the user picked. We therefore HARD REJECT
+//	candidates whose overhang exceeds a small tolerance (Nt*20 > N,
+//	i.e. >~5% of inside pixels are transparent). The tolerance keeps
+//	anti-aliased silhouette edges usable.
 //
 // apply_candidate_v2:
-//   Blends a chosen shape into the current canvas. Operates on a tight
-//   bounding box and skips transparent pixels.
+//
+//	Blends a chosen shape into the current canvas. Operates on a tight
+//	bounding box and skips transparent pixels.
 //
 // compute_error_grid:
-//   Buckets the per-pixel squared error of (target - current) into a
-//   downsampled gridW x gridH buffer. The host side reads it back and
-//   uses it to bias random candidate placement towards high-error
-//   regions.
+//
+//	Buckets the per-pixel squared error of (target - current) into a
+//	downsampled gridW x gridH buffer. The host side reads it back and
+//	uses it to bias random candidate placement towards high-error
+//	regions.
 const evaluateKernelSource = `
 __kernel void evaluate_candidates_v3(
     __global const float4* target,
@@ -55,7 +58,8 @@ __kernel void evaluate_candidates_v3(
     __global const float* candidates,
     __global float* results,
     const int width,
-    const int height
+    const int height,
+    const int sampleStep
 ) {
     int gid = get_global_id(0);
 
@@ -99,10 +103,12 @@ __kernel void evaluate_candidates_v3(
     float sCR2 = 0.0f, sCG2 = 0.0f, sCB2 = 0.0f, sCA2 = 0.0f;   // Σ current²
     float sTCR = 0.0f, sTCG = 0.0f, sTCB = 0.0f, sTCA = 0.0f;   // Σ target·current
 
-    for (int y = yMin; y <= yMax; ++y) {
+    int sampleStride = max(sampleStep, 1);
+
+    for (int y = yMin; y <= yMax; y += sampleStride) {
         int row = y * width;
         float dy = ((float)y + 0.5f) - cy;
-        for (int x = xMin; x <= xMax; ++x) {
+        for (int x = xMin; x <= xMax; x += sampleStride){
             float dx = ((float)x + 0.5f) - cx;
             float xr = dx * cosT + dy * sinT;
             float yr = -dx * sinT + dy * cosT;
@@ -175,6 +181,9 @@ __kernel void evaluate_candidates_v3(
 
     float totalDelta = dR + dG + dB + dA;
 
+    float sampleScale = (float)(sampleStride * sampleStride);
+    totalDelta *= sampleScale;
+
     // Soft penalty within the tolerance budget: each remaining
     // transparent pixel still adds α²·(1+oR²+oG²+oB²) so that the
     // optimiser prefers zero overhang over allowed overhang when the
@@ -211,7 +220,8 @@ __kernel void evaluate_candidates_v4(
     __global const float* candidates,
     __global float* results,
     const int width,
-    const int height
+    const int height,
+    const int sampleStep
 ) {
     int gid = get_group_id(0);   // candidate index
     int lid = get_local_id(1) * get_local_size(0) + get_local_id(0); // 0..255
@@ -256,11 +266,18 @@ __kernel void evaluate_candidates_v4(
     float sCR2 = 0.0f, sCG2 = 0.0f, sCB2 = 0.0f, sCA2 = 0.0f;
     float sTCR = 0.0f, sTCG = 0.0f, sTCB = 0.0f, sTCA = 0.0f;
 
+
+    int sampleStride = max(sampleStep, 1);
+
     for (int ci = lid; ci < totalCells; ci += WG_SIZE) {
         int ly = ci / bw;
         int lx = ci % bw;
         int x = xMin + lx;
         int y = yMin + ly;
+
+        if (((x - xMin) % sampleStride) != 0 || ((y - yMin) % sampleStride) != 0) {
+            continue;
+        }
 
         float dx = ((float)x + 0.5f) - cx;
         float dy = ((float)y + 0.5f) - cy;
@@ -355,6 +372,10 @@ __kernel void evaluate_candidates_v4(
              - two_a * (sTA - sCA - sTCA + sCA2);
 
     float totalDelta = dR + dG + dB + dA;
+
+    float sampleScale = (float)(sampleStride * sampleStride);
+    totalDelta *= sampleScale;
+
     if (Nt > 0) {
         totalDelta += a2 * ((float)Nt) * (oR*oR + oG*oG + oB*oB + 1.0f);
     }

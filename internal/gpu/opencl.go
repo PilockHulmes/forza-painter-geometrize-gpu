@@ -81,6 +81,8 @@ type Evaluator struct {
 
 	UseWorkGroupEval bool
 
+	SampleStep int
+
 	// wgSize is the work-group size for evaluate_candidates_v4 (16×16).
 	wgSize int
 
@@ -261,6 +263,7 @@ func NewEvaluator(target, current []float32, mask []uint8, width, height int, ma
 		maxCandidates: maxCandidates,
 		gridW:         gridW,
 		gridH:         gridH,
+		SampleStep:    1,
 	}
 
 	cleanup := func() {
@@ -492,6 +495,7 @@ func (e *Evaluator) SubmitEval(cands []model.Candidate) (EvalTicket, error) {
 			e.resultBuffers[slot],
 			int32(e.width),
 			int32(e.height),
+			int32(e.SampleStep),
 		); err != nil {
 			return EvalTicket{}, err
 		}
@@ -515,6 +519,7 @@ func (e *Evaluator) SubmitEval(cands []model.Candidate) (EvalTicket, error) {
 			e.resultBuffers[slot],
 			int32(e.width),
 			int32(e.height),
+			int32(e.SampleStep),
 		); err != nil {
 			return EvalTicket{}, err
 		}

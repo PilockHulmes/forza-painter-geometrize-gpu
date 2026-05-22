@@ -26,8 +26,8 @@ func DefaultSettings() model.Settings {
 		SaveEvery:                     10,
 		StopAt:                        3000,
 		UseWorkGroupEval:              true,
-		EnableProgressiveSampling:     true,
-		ProgressiveSamplingStart:      4, // New parametrs
+		EnableProgressiveSampling:     false,
+		ProgressiveSamplingStart:      4,
 		ProgressiveSamplingEnd:        1,
 		ProgressiveSamplingTransition: 0.333,
 		ProgressiveSamplingCurve:      2.5,

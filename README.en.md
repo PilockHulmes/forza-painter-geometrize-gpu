@@ -20,17 +20,37 @@ This is a third-party geometrize JSON generation tool for [forza-painter](https:
 ```text
 Go w/ CGO >= v1.24
 OpenCL-SDK >= v3.0.19
+Vulkan SDK >= 1.4.350.0
 ```
+
+OpenCL-SDK is only needed at build time for linking. Vulkan SDK is used to compile the Vulkan backend and package `vulkan-1.dll`; end users do not need to install the Vulkan SDK to run the release package.
 
 ### Build on Windows
 
-Clone this project, download the Windows release of [OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK/releases/tag/v2025.07.23), and place it in `/OpenCL-SDK`.
+Clone this project, download the Windows release of [OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK/releases/tag/v2025.07.23), and place it in the repository root as `OpenCL-SDK`.
+Install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) as well. The build script defaults to `C:\VulkanSDK\1.4.350.0`, or you can point `VULKAN_SDK` to another installed version.
+
+Running `build.ps1` compiles the `.comp` shader sources, builds the single binary, and packages the release under `dist`:
+
+- `dist\forza-painter-geometrize-go.exe`
+- `dist\vulkan-1.dll`
+- `dist\shaders\*.spv`
+
+Build a single binary and generate the release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "build-opencl.ps1"
+powershell -ExecutionPolicy Bypass -File "build.ps1"
 ```
 
-For Linux/macOS, check `build-opencl.ps1` and set `CGO_CFLAGS` and `CGO_LDFLAGS` accordingly.
+To customize the output file name:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "build.ps1" -OutputName "forza-painter-geometrize-go.exe"
+```
+
+The resulting binary includes both OpenCL and Vulkan support, and you can switch at runtime with `-backend opencl` or `-backend vulkan`. The release package already ships `vulkan-1.dll` and the SPIR-V shader files, so the target machine usually does not need a separate Vulkan SDK installation.
+
+For Linux/macOS, use `build.ps1` as a reference and adjust `CGO_CFLAGS` and `CGO_LDFLAGS` accordingly.
 
 ## Usage
 

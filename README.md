@@ -20,17 +20,37 @@
 ```
 Go w/ CGO >= v1.24
 OpenCL-SDK >= v3.0.19
+Vulkan SDK >= 1.4.350.0
 ```
+
+其中 OpenCL-SDK 仅用于构建时链接，Vulkan SDK 仅用于编译 Vulkan 后端和打包 `vulkan-1.dll`，运行时发布包不需要用户再单独安装 Vulkan SDK。
 
 ### 编译Windows版本
 
-克隆本项目，下载[OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK/releases/tag/v2025.07.23)的windows版本，放置在/OpenCL-SDK中
+克隆本项目，下载[OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK/releases/tag/v2025.07.23)的Windows版本并放到仓库根目录的`OpenCL-SDK`目录下。
+同时安装[Vulkan SDK](https://vulkan.lunarg.com/sdk/home)，默认使用`C:\VulkanSDK\1.4.350.0`，也可以通过`VULKAN_SDK`环境变量指定其他版本。
+
+执行 `build.ps1` 后，会自动编译 `.comp` 着色器并生成单文件程序，然后把发布包输出到 `dist`：
+
+- `dist\forza-painter-geometrize-go.exe`
+- `dist\vulkan-1.dll`
+- `dist\shaders\*.spv`
+
+一次性构建单个二进制并生成发布包：
 
 ```PowerShell
-powershell -ExecutionPolicy Bypass -File "build-opencl.ps1"
+powershell -ExecutionPolicy Bypass -File "build.ps1"
 ```
 
-对于Linux/MacOS，请阅读build-opencl.ps1的内容设置CGO_CFLAGS以及CGO_LDFLAGS，我相信你能做到的！
+如果你只想指定输出文件名：
+
+```PowerShell
+powershell -ExecutionPolicy Bypass -File "build.ps1" -OutputName "forza-painter-geometrize-go.exe"
+```
+
+这个二进制同时包含OpenCL和Vulkan后端，运行时通过`-backend opencl`或`-backend vulkan`切换。发布包已经带上 `vulkan-1.dll` 和 SPIR-V 着色器文件，目标机器通常不需要单独安装 Vulkan SDK。
+
+对于Linux/MacOS，请参考`build.ps1`里的`CGO_CFLAGS`和`CGO_LDFLAGS`配置方式自行调整。
 
 ## 开始使用
 

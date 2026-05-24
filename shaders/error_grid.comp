@@ -1,0 +1,57 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer TargetBuf  { vec4 target[]; };
+layout(std430, set = 0, binding = 1) buffer       CurrentBuf { vec4 current[]; };
+layout(std430, set = 0, binding = 2) readonly buffer MaskBuf    { float mask[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer GridOutBuf { float gridOut[]; };
+
+layout(push_constant) uniform Params {
+    int width;
+    int height;
+    int gridW;
+    int gridH;
+};
+
+void main() {
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= gridW || gy >= gridH) {
+        return;
+    }
+
+    int x0 = int((float(gx) * float(width)) / float(gridW));
+    int x1 = int((float(gx + 1) * float(width)) / float(gridW));
+    int y0 = int((float(gy) * float(height)) / float(gridH));
+    int y1 = int((float(gy + 1) * float(height)) / float(gridH));
+
+    float sum = 0.0;
+    for (int y = y0; y < y1; ++y) {
+        int row = y * width;
+        for (int x = x0; x < x1; ++x) {
+            int p = row + x;
+            if (mask[p] == 0.0) {
+                continue;
+            }
+            vec4 t = target[p];
+            vec4 s = current[p];
+            float tr = t.x;
+            float tg = t.y;
+            float tb = t.z;
+            float ta = t.w;
+            float sr = s.x;
+            float sg = s.y;
+            float sb = s.z;
+            float sa = s.w;
+            float dr = tr - sr;
+            float dg = tg - sg;
+            float db = tb - sb;
+            float da = ta - sa;
+            sum += dr * dr + dg * dg + db * db + da * da;
+        }
+    }
+    gridOut[gy * gridW + gx] = sum;
+}

@@ -15,49 +15,6 @@ import (
 // Overridable via settings.ini errorGridSize.
 const DefaultErrorGridSize = 64
 
-// ringSize is the number of candidate / result / grid host+device staging
-// buffers kept in flight. With size 3 the engine can submit work for the
-// next round while the previous round is still being read back, which is
-// the foundation that lets us hide CPU candidate generation behind GPU
-// kernels (e.g. apply + grid recompute) without ever stalling on a
-// blocking transfer.
-const ringSize = 3
-
-// EvalResult holds the score and the optimal RGB color for a single
-// evaluated candidate. RGB is computed analytically by the GPU; the engine
-// stores it back into the candidate before applying the chosen shape.
-type EvalResult struct {
-	Score float32
-	R     float32
-	G     float32
-	B     float32
-}
-
-// EvalTicket is returned by SubmitEval and consumed by WaitEval. It is
-// just a typed handle into the evaluator's ring of in-flight slots; the
-// sequence number guards against stale tickets being waited on twice.
-type EvalTicket struct {
-	slot  int
-	seq   uint64
-	count int
-	valid bool
-}
-
-// GridTicket is the equivalent handle for an in-flight error-grid update.
-type GridTicket struct {
-	slot  int
-	seq   uint64
-	valid bool
-}
-
-// Valid reports whether the ticket refers to an actual in-flight
-// submission. The zero value of GridTicket is invalid.
-func (t GridTicket) Valid() bool { return t.valid }
-
-// Valid reports whether the ticket refers to an actual in-flight
-// submission. The zero value of EvalTicket is invalid.
-func (t EvalTicket) Valid() bool { return t.valid }
-
 type evalSlot struct {
 	readEvt *cl.Event
 	seq     uint64
@@ -360,11 +317,7 @@ func NewEvaluator(target, current []float32, mask []uint8, width, height, maxCan
 	return e, nil
 }
 
-func (e *Evaluator) Close() {
-	// Drain queue first so no async work touches buffers we are about to
-	// release. Flush also clears every slot's event/busy bookkeeping, so
-	// we don't need a second pass to release events here. Errors are
-	// deliberately ignored - we are tearing down.
+func (e *Evaluator) Close() error {
 	_ = e.Flush()
 
 	for i := 0; i < ringSize; i++ {
@@ -408,6 +361,7 @@ func (e *Evaluator) Close() {
 	if e.context != nil {
 		e.context.Release()
 	}
+	return nil
 }
 
 // Flush blocks until every command previously enqueued on the internal
@@ -792,6 +746,9 @@ func (e *Evaluator) ResetCurrentBuffer(current []float32) error {
 	}
 	return err
 }
+
+func (e *Evaluator) SetUseWorkGroupEval(v bool) { e.UseWorkGroupEval = v }
+func (e *Evaluator) SetSampleStep(v int)        { e.SampleStep = v }
 
 func scoreDevice(d *cl.Device) int64 {
 	var score int64

@@ -1,0 +1,140 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer TargetBuf  { vec4 target[]; };
+layout(std430, set = 0, binding = 1) buffer       CurrentBuf { vec4 current[]; };
+layout(std430, set = 0, binding = 2) readonly buffer MaskBuf    { float mask[]; };
+layout(std430, set = 0, binding = 3) readonly buffer CandBuf   { float candidates[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer ResultBuf { vec4 results[]; };
+
+layout(push_constant) uniform Params {
+    int width;
+    int height;
+    int sampleStep;
+    int candidateCount;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uint(candidateCount)) {
+        return;
+    }
+
+    int base = int(gid) * 6;
+    float cx       = candidates[base + 0];
+    float cy       = candidates[base + 1];
+    float rx       = max(candidates[base + 2], 1.0);
+    float ry       = max(candidates[base + 3], 1.0);
+    float thetaDeg = candidates[base + 4];
+    float ca       = clamp(candidates[base + 5], 1e-3, 1.0);
+
+    float theta = thetaDeg * 0.01745329251994329577;
+    float cosT  = cos(theta);
+    float sinT  = sin(theta);
+    float invRX2 = 1.0 / (rx * rx);
+    float invRY2 = 1.0 / (ry * ry);
+
+    float rx2  = rx * rx;
+    float ry2  = ry * ry;
+    float cos2 = cosT * cosT;
+    float sin2 = sinT * sinT;
+    float ex   = sqrt(rx2 * cos2 + ry2 * sin2);
+    float ey   = sqrt(rx2 * sin2 + ry2 * cos2);
+
+    int xMin = int(floor(cx - ex - 1.0));
+    int xMax = int(ceil(cx + ex + 1.0));
+    int yMin = int(floor(cy - ey - 1.0));
+    int yMax = int(ceil(cy + ey + 1.0));
+
+    xMin = max(0, xMin);
+    yMin = max(0, yMin);
+    xMax = min(width - 1, xMax);
+    yMax = min(height - 1, yMax);
+
+    int N   = 0;
+    int Nt  = 0;
+    float sTR  = 0.0; float sTG  = 0.0; float sTB  = 0.0; float sTA  = 0.0;
+    float sCR  = 0.0; float sCG  = 0.0; float sCB  = 0.0; float sCA  = 0.0;
+    float sCR2 = 0.0; float sCG2 = 0.0; float sCB2 = 0.0; float sCA2 = 0.0;
+    float sTCR = 0.0; float sTCG = 0.0; float sTCB = 0.0; float sTCA = 0.0;
+
+    int sampleStride = max(sampleStep, 1);
+
+    for (int y = yMin; y <= yMax; y += sampleStride) {
+        int row = y * width;
+        float dy = (float(y) + 0.5) - cy;
+        for (int x = xMin; x <= xMax; x += sampleStride) {
+            float dx = (float(x) + 0.5) - cx;
+            float xr = dx * cosT + dy * sinT;
+            float yr = -dx * sinT + dy * cosT;
+            if (xr * xr * invRX2 + yr * yr * invRY2 > 1.0) {
+                continue;
+            }
+            int p = row + x;
+            if (mask[p] == 0.0) {
+                Nt++;
+                continue;
+            }
+
+            vec4 t = target[p];
+            vec4 s = current[p];
+
+            float tr = t.x;
+            float tg = t.y;
+            float tb = t.z;
+            float ta = t.w;
+            float sr = s.x;
+            float sg = s.y;
+            float sb = s.z;
+            float sa = s.w;
+
+            sTR += tr; sTG += tg; sTB += tb; sTA += ta;
+            sCR += sr; sCG += sg; sCB += sb; sCA += sa;
+            sCR2 += sr * sr; sCG2 += sg * sg;
+            sCB2 += sb * sb; sCA2 += sa * sa;
+            sTCR += tr * sr; sTCG += tg * sg;
+            sTCB += tb * sb; sTCA += ta * sa;
+            N++;
+        }
+    }
+
+    if (N == 0 || Nt * 100 > N) {
+        results[gid] = vec4(3.402823466e+38, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float Nf   = float(N);
+    float invN = 1.0 / Nf;
+    float invA = 1.0 - ca;
+
+    float oR = clamp((sTR * invN - (sCR * invN) * invA) / ca, 0.0, 1.0);
+    float oG = clamp((sTG * invN - (sCG * invN) * invA) / ca, 0.0, 1.0);
+    float oB = clamp((sTB * invN - (sCB * invN) * invA) / ca, 0.0, 1.0);
+
+    float a2    = ca * ca;
+    float two_a = 2.0 * ca;
+
+    float dR = a2 * (Nf*oR*oR - 2.0*oR*sCR + sCR2)
+             - two_a * (oR*sTR - oR*sCR - sTCR + sCR2);
+    float dG = a2 * (Nf*oG*oG - 2.0*oG*sCG + sCG2)
+             - two_a * (oG*sTG - oG*sCG - sTCG + sCG2);
+    float dB = a2 * (Nf*oB*oB - 2.0*oB*sCB + sCB2)
+             - two_a * (oB*sTB - oB*sCB - sTCB + sCB2);
+    float dA = a2 * (Nf - 2.0*sCA + sCA2)
+             - two_a * (sTA - sCA - sTCA + sCA2);
+
+    float totalDelta = dR + dG + dB + dA;
+
+    float sampleScale = float(sampleStride * sampleStride);
+    totalDelta *= sampleScale;
+
+    if (Nt > 0) {
+        float penalty = a2 * float(Nt) * (oR*oR + oG*oG + oB*oB + 1.0);
+        totalDelta += penalty;
+    }
+
+    results[gid] = vec4(totalDelta, oR, oG, oB);
+}

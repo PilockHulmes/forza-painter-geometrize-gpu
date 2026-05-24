@@ -11,17 +11,18 @@ import (
 )
 
 func main() {
-	fmt.Println("Version: v1.1-20260522")
+	fmt.Println("Version: v1.2-Canary-20260524")
 	settingsPath := flag.String("settings", "", "Path to settings ini file")
 	profile := flag.String("profile", "", "Profile name fragment under ./settings")
 	outputPath := flag.String("output", "", "Output path prefix (default: input image path)")
 	previewPath := flag.String("preview", "", "Optional preview PNG output path")
 	seed := flag.Int64("seed", 0, "Optional RNG seed for reproducible output")
+	backend := flag.String("backend", "opencl", "GPU backend: opencl (default) or vulkan")
 	flag.Parse()
-	applyTrailingOptions(flag.Args()[1:], settingsPath, profile, outputPath, previewPath, seed)
+	applyTrailingOptions(flag.Args()[1:], settingsPath, profile, outputPath, previewPath, seed, backend)
 
 	if flag.NArg() < 1 {
-		fmt.Println("Usage: forza-painter-geometrize [--settings path.ini|--profile name] [--output path] [--preview path] [--seed n] <image-path>")
+		fmt.Println("Usage: forza-painter-geometrize [--backend opencl|vulkan] [--settings path.ini|--profile name] [--output path] [--preview path] [--seed n] <image-path>")
 		os.Exit(1)
 	}
 
@@ -36,6 +37,7 @@ func main() {
 		PreviewPath:   normalizePreviewPath(*previewPath),
 		WorkspaceRoot: absRoot,
 		Seed:          *seed,
+		Backend:       *backend,
 	}
 
 	if err := engine.Run(opts); err != nil {
@@ -74,7 +76,7 @@ func normalizePreviewPath(path string) string {
 	return abs
 }
 
-func applyTrailingOptions(extra []string, settingsPath, profile, outputPath, previewPath *string, seed *int64) {
+func applyTrailingOptions(extra []string, settingsPath, profile, outputPath, previewPath *string, seed *int64, backend *string) {
 	for i := 0; i < len(extra); i++ {
 		arg := extra[i]
 		next := func() (string, bool) {
@@ -108,6 +110,10 @@ func applyTrailingOptions(extra []string, settingsPath, profile, outputPath, pre
 				if _, err := fmt.Sscanf(v, "%d", &parsed); err == nil {
 					*seed = parsed
 				}
+			}
+		case "--backend", "-backend":
+			if v, ok := next(); ok {
+				*backend = v
 			}
 		}
 	}

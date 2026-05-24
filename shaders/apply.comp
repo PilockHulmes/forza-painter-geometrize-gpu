@@ -1,0 +1,68 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 1) buffer       CurrentBuf { vec4 current[]; };
+layout(std430, set = 0, binding = 2) readonly buffer MaskBuf    { float mask[]; };
+
+layout(push_constant) uniform Params {
+    int   width;
+    int   height;
+    int   xMin;
+    int   yMin;
+    int   xMax;
+    int   yMax;
+    float cx;
+    float cy;
+    float rxRaw;
+    float ryRaw;
+    float thetaDeg;
+    float cr;
+    float cg;
+    float cb;
+    float ca;
+};
+
+void main() {
+    int lx = int(gl_GlobalInvocationID.x);
+    int ly = int(gl_GlobalInvocationID.y);
+    int bw = xMax - xMin + 1;
+    int bh = yMax - yMin + 1;
+    if (lx >= bw || ly >= bh) {
+        return;
+    }
+    int x = xMin + lx;
+    int y = yMin + ly;
+    int p = y * width + x;
+    if (mask[p] == 0.0) {
+        return;
+    }
+
+    vec4 src = current[p];
+
+    float rx   = max(rxRaw, 1.0);
+    float ry   = max(ryRaw, 1.0);
+    float theta = thetaDeg * 0.01745329251994329577;
+    float cosT = cos(theta);
+    float sinT = sin(theta);
+    float invRX2 = 1.0 / (rx * rx);
+    float invRY2 = 1.0 / (ry * ry);
+
+    float dx = (float(x) + 0.5) - cx;
+    float dy = (float(y) + 0.5) - cy;
+    float xr = dx * cosT + dy * sinT;
+    float yr = -dx * sinT + dy * cosT;
+    if (xr * xr * invRX2 + yr * yr * invRY2 > 1.0) {
+        return;
+    }
+
+    float alpha = clamp(ca, 0.0, 1.0);
+    float invA  = 1.0 - alpha;
+    src.x = src.x * invA + clamp(cr, 0.0, 1.0) * alpha;
+    src.y = src.y * invA + clamp(cg, 0.0, 1.0) * alpha;
+    src.z = src.z * invA + clamp(cb, 0.0, 1.0) * alpha;
+    src.w = src.w * invA + alpha;
+    current[p] = src;
+}

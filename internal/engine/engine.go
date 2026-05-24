@@ -23,6 +23,7 @@ type Options struct {
 	PreviewPath   string
 	WorkspaceRoot string
 	Seed          int64
+	Backend       string
 }
 
 const (
@@ -65,7 +66,10 @@ func Run(opts Options) error {
 		maxBatch = cfg.MutatedSamples
 	}
 	gridSize := cfg.ErrorGridSize
-	evaluator, err := gpu.NewEvaluator(prepared.Target, prepared.Current, prepared.OpaqueMask, prepared.Width, prepared.Height, maxBatch, gridSize)
+	evaluator, err := gpu.NewBackend(opts.Backend, prepared.Target, prepared.Current, prepared.OpaqueMask, prepared.Width, prepared.Height, maxBatch, gridSize)
+	if err != nil {
+		return err
+	}
 	// fmt.Println("")
 
 	// fmt.Println("=== Progressive Sampling ===")
@@ -105,8 +109,10 @@ func Run(opts Options) error {
 	// if err != nil {
 	// 	return err
 	// }
-	evaluator.UseWorkGroupEval = cfg.UseWorkGroupEval
+	evaluator.SetUseWorkGroupEval(cfg.UseWorkGroupEval)
 	defer evaluator.Close()
+
+	fmt.Printf("Backend: %s\n", resolveBackendName(opts.Backend))
 
 	rng := rand.New(rand.NewSource(seedValue(opts.Seed)))
 	currentError, opaquePixels := computeTotalError(prepared.Target, prepared.Current, prepared.OpaqueMask)
@@ -153,14 +159,14 @@ func Run(opts Options) error {
 			progress = float32(acceptedShapes) / float32(cfg.StopAt)
 		}
 
-		evaluator.SampleStep = scoringSampleStep(cfg, progress)
+		evaluator.SetSampleStep(scoringSampleStep(cfg, progress))
 
 		// fmt.Printf("[%d/%d] Scoring sample step: %d\n",
 		// 	step, cfg.StopAt, evaluator.SampleStep)
 
 		randomCands := randomCandidates(rng, prepared, cfg.RandomSamples, cfg.ForceOpaqueShapes, sampler, progress)
 
-		fmt.Printf("[%d/%d] Evaluating random sample batch on OpenCL (%d)...\n", step, cfg.StopAt, len(randomCands))
+		fmt.Printf("[%d/%d] Evaluating random sample batch on GPU (%d)...\n", step, cfg.StopAt, len(randomCands))
 		best, bestScore, err := submitAndPickBest(evaluator, randomCands)
 		if err != nil {
 			return err
@@ -200,23 +206,27 @@ func Run(opts Options) error {
 
 		consecutiveNoImprove = 0
 
-		// Quantize geometry + colour to the integer grid that will end
-		// up in the JSON; apply that exact shape so the GPU canvas
-		// matches what the game will render from the JSON later.
+		// Quantize the accepted geometry first, then re-evaluate that exact
+		// candidate so the applied canvas, score bookkeeping, and exported
+		// JSON all describe the same shape.
 		final := quantizeCandidate(best, prepared.Width, prepared.Height, cfg.ForceOpaqueShapes)
+		final, finalScore, err := submitAndPickBest(evaluator, []model.Candidate{final})
+		if err != nil {
+			return err
+		}
 
 		// Submit apply non-blocking; the in-order queue ensures any
 		// follow-up eval / grid kernel sees the updated canvas.
 		if err := evaluator.SubmitApply(final); err != nil {
 			return err
 		}
-		currentError += float64(bestScore)
+		currentError += float64(finalScore)
 		if currentError < 0 {
 			currentError = 0
 		}
 		shapes = append(shapes, toShape(final, normalizeScore(currentError, denom)))
 		acceptedShapes++
-		fmt.Printf("[%d/%d] Added rotated ellipse #%d (delta %.6f)\n", acceptedShapes, cfg.StopAt, len(shapes)-1, bestScore)
+		fmt.Printf("[%d/%d] Added rotated ellipse #%d (delta %.6f)\n", acceptedShapes, cfg.StopAt, len(shapes)-1, finalScore)
 
 		if shouldSave(acceptedShapes, cfg) {
 			if err := saveShapes(opts, shapes, acceptedShapes); err != nil {
@@ -588,7 +598,7 @@ func mutatedCandidates(rng *rand.Rand, prepared *imageutil.PreparedImage, base m
 // returns the lowest-score candidate with its GPU-computed optimal color
 // merged in. This is the tight inner loop of both random sampling and
 // hill climb.
-func submitAndPickBest(e *gpu.Evaluator, cands []model.Candidate) (model.Candidate, float32, error) {
+func submitAndPickBest(e gpu.Backend, cands []model.Candidate) (model.Candidate, float32, error) {
 	t, err := e.SubmitEval(cands)
 	if err != nil {
 		return model.Candidate{}, 0, err
@@ -679,7 +689,7 @@ func randRange(rng *rand.Rand, minV, maxV float32) float32 {
 	return minV + (maxV-minV)*rng.Float32()
 }
 
-func savePreviewSnapshot(evaluator *gpu.Evaluator, opts Options, width, height, step int) error {
+func savePreviewSnapshot(evaluator gpu.Backend, opts Options, width, height, step int) error {
 	if opts.PreviewPath == "" {
 		return nil
 	}
@@ -772,6 +782,13 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func resolveBackendName(name string) string {
+	if name == "vulkan" {
+		return "Vulkan"
+	}
+	return "OpenCL"
 }
 
 func scoringSampleStep(cfg model.Settings, progress float32) int {

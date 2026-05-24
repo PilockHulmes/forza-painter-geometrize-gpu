@@ -6,7 +6,7 @@ This is a third-party geometrize JSON generation tool for [forza-painter](https:
 
 ## Differences from the original project
 
-- Uses [OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK) to run error evaluation and primitive rasterization on the GPU for substantial speedups.
+- Uses [OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK)/Vulkan to run error evaluation and primitive rasterization on the GPU for substantial speedups.
 - Keeps only Rotated Ellipse rendering (other primitives are not needed for forza-painter).
 - Supports PNG alpha input and protects transparent source pixels from being covered by generated geometry.
 - Supports parallel batch candidate evaluation for additional performance gains.
@@ -58,6 +58,8 @@ For Linux/macOS, use `build.ps1` as a reference and adjust `CGO_CFLAGS` and `CGO
 
 ```text
 Usage of forza-painter-geometrize-go.exe:
+  -backend string
+        GPU backend: opencl (default) or vulkan (default "opencl")
   -output string
         Output path prefix (default: input image path)
   -preview string

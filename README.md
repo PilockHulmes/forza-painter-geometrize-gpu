@@ -6,7 +6,7 @@
 
 ## 本项目和原始项目的差异
 
-- 通过[OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK)调用GPU进行误差计算和图元栅格化，以大幅度提升生成效率
+- 通过[OpenCL-SDK](https://github.com/KhronosGroup/OpenCL-SDK)/Vulkan调用GPU进行误差计算和图元栅格化，以大幅度提升生成效率
 - 仅保留Rotated Ellipse渲染，没有其他几何的渲染（forza-painter用不到）
 - 支持PNG格式原图输入alpha通道，保护原有透明像素不会被几何覆盖
 - 支持批量候选并行评估，进一步提升生成效率
@@ -42,7 +42,7 @@ Vulkan SDK >= 1.4.350.0
 powershell -ExecutionPolicy Bypass -File "build.ps1"
 ```
 
-如果你只想指定输出文件名：
+如果你想指定输出文件名：
 
 ```PowerShell
 powershell -ExecutionPolicy Bypass -File "build.ps1" -OutputName "forza-painter-geometrize-go.exe"
@@ -58,6 +58,8 @@ powershell -ExecutionPolicy Bypass -File "build.ps1" -OutputName "forza-painter-
 
 ```
 Usage of forza-painter-geometrize-go.exe:
+  -backend string
+        GPU backend: opencl (default) or vulkan (default "opencl")
   -output string
         Output path prefix (default: input image path)
   -preview string

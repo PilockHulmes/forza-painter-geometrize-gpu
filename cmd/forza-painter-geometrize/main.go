@@ -23,7 +23,7 @@ func main() {
 	applyTrailingOptions(flag.Args()[1:], settingsPath, profile, outputPath, previewPath, seed, backend, resumePath)
 
 	if flag.NArg() < 1 {
-		fmt.Println("Usage: forza-painter-geometrize [--backend opencl|vulkan] [--settings path.ini|--profile name] [--output path] [--preview path] [--seed n] <image-path>")
+		fmt.Println("Usage: forza-painter-geometrize [--backend opencl|vulkan] [--settings path.ini|--profile name] [--output path] [--preview path] [--seed n] [--resume checkpoint.json] <image-path>")
 		os.Exit(1)
 	}
 

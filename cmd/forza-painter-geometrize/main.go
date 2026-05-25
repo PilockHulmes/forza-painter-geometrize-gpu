@@ -18,8 +18,9 @@ func main() {
 	previewPath := flag.String("preview", "", "Optional preview PNG output path")
 	seed := flag.Int64("seed", 0, "Optional RNG seed for reproducible output")
 	backend := flag.String("backend", "opencl", "GPU backend: opencl (default) or vulkan")
+	resumePath := flag.String("resume", "", "Resume from a saved geometry checkpoint JSON")
 	flag.Parse()
-	applyTrailingOptions(flag.Args()[1:], settingsPath, profile, outputPath, previewPath, seed, backend)
+	applyTrailingOptions(flag.Args()[1:], settingsPath, profile, outputPath, previewPath, seed, backend, resumePath)
 
 	if flag.NArg() < 1 {
 		fmt.Println("Usage: forza-painter-geometrize [--backend opencl|vulkan] [--settings path.ini|--profile name] [--output path] [--preview path] [--seed n] <image-path>")
@@ -38,6 +39,7 @@ func main() {
 		WorkspaceRoot: absRoot,
 		Seed:          *seed,
 		Backend:       *backend,
+		ResumePath:    *resumePath,
 	}
 
 	if err := engine.Run(opts); err != nil {
@@ -76,7 +78,7 @@ func normalizePreviewPath(path string) string {
 	return abs
 }
 
-func applyTrailingOptions(extra []string, settingsPath, profile, outputPath, previewPath *string, seed *int64, backend *string) {
+func applyTrailingOptions(extra []string, settingsPath, profile, outputPath, previewPath *string, seed *int64, backend *string, resumePath *string) {
 	for i := 0; i < len(extra); i++ {
 		arg := extra[i]
 		next := func() (string, bool) {
@@ -114,6 +116,10 @@ func applyTrailingOptions(extra []string, settingsPath, profile, outputPath, pre
 		case "--backend", "-backend":
 			if v, ok := next(); ok {
 				*backend = v
+			}
+		case "--resume", "-resume":
+			if v, ok := next(); ok {
+				*resumePath = v
 			}
 		}
 	}

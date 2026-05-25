@@ -24,6 +24,7 @@ type Options struct {
 	WorkspaceRoot string
 	Seed          int64
 	Backend       string
+	ResumePath    string
 }
 
 const (
@@ -119,9 +120,29 @@ func Run(opts Options) error {
 	denom := float64(maxInt(1, opaquePixels*4))
 
 	shapes := []model.Shape{backgroundShape(prepared, normalizeScore(currentError, denom))}
+	acceptedShapes := 0
 
 	moveStep, radiusStep := mutationSteps(prepared.Width, prepared.Height)
 	hillClimbRounds, mutationsPerRound := planHillClimb(cfg.MutatedSamples)
+
+	resumePath := opts.ResumePath
+	if resumePath == "" {
+		resumePath = cfg.LoadGeometry
+	}
+	if resumePath != "" {
+		restoredShapes, restoredCount, resumeErr := restoreCheckpoint(resumePath, prepared, cfg.ForceOpaqueShapes, evaluator)
+		if resumeErr != nil {
+			return resumeErr
+		}
+		if restoredCount >= cfg.StopAt {
+			return fmt.Errorf("checkpoint already has %d shapes (target stopAt=%d)", restoredCount, cfg.StopAt)
+		}
+		shapes = restoredShapes
+		acceptedShapes = restoredCount
+		currentError, opaquePixels = computeTotalError(prepared.Target, prepared.Current, prepared.OpaqueMask)
+		denom = float64(maxInt(1, opaquePixels*4))
+		fmt.Printf("Resumed from checkpoint: %s (%d/%d shapes)\n", resumePath, acceptedShapes, cfg.StopAt)
+	}
 
 	// Initial sampler is computed synchronously - the engine has nothing
 	// useful to do until the first random batch can be sampled.
@@ -141,7 +162,6 @@ func Run(opts Options) error {
 	fmt.Println("Pipeline: async (in-order queue, ring=3; sampler 1-shape stale)")
 	fmt.Println("Scoring mode: DeltaE with GPU-computed optimal color (negative = better)")
 
-	acceptedShapes := 0
 	consecutiveNoImprove := 0
 	finalPruneAttempts := 0
 	lastPrunedMilestone := 0

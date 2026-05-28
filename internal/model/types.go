@@ -24,10 +24,10 @@ type Settings struct {
 }
 
 type Shape struct {
-	Type  int     `json:"type"`
-	Data  []int   `json:"data"`
-	Color []int   `json:"color"`
-	Score float64 `json:"score"`
+	Type  int       `json:"type"`
+	Data  []float64 `json:"data"`
+	Color []int     `json:"color"`
+	Score float64   `json:"score"`
 }
 
 type Geometry struct {

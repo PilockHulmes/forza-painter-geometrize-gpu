@@ -10,38 +10,14 @@ import (
 	"forza-painter-geometrize-go/internal/model"
 )
 
-func applyPixels(dst []float32, mask []uint8, width, height, xMin, xMax, yMin, yMax int, cx, cy, cosT, sinT float32, c model.Candidate, insideFn func(xr, yr float32) bool) {
-	for y := yMin; y <= yMax; y++ {
-		for x := xMin; x <= xMax; x++ {
-			if mask[y*width+x] == 0 {
-				continue
-			}
-			dx := float32(x) + 0.5 - cx
-			dy := float32(y) + 0.5 - cy
-			xr := dx*cosT + dy*sinT
-			yr := -dx*sinT + dy*cosT
-			if !insideFn(xr, yr) {
-				continue
-			}
-			idx := (y*width + x) * 4
-			alpha := c.A
-			inv := 1.0 - alpha
-			dst[idx+0] = dst[idx+0]*inv + c.R*alpha
-			dst[idx+1] = dst[idx+1]*inv + c.G*alpha
-			dst[idx+2] = dst[idx+2]*inv + c.B*alpha
-			dst[idx+3] = dst[idx+3]*inv + alpha
-		}
-	}
-}
-
 func ApplyShape(dst []float32, mask []uint8, width, height int, c model.Candidate) {
 	switch c.ShapeType {
-	case 1:
-		ApplyEllipse(dst, mask, width, height, c)
+	case 0:
+		ApplyRectangle(dst, mask, width, height, c)
 	case 2:
 		ApplyTriangle(dst, mask, width, height, c)
 	default:
-		ApplyRectangle(dst, mask, width, height, c)
+		ApplyEllipse(dst, mask, width, height, c)
 	}
 }
 
@@ -120,6 +96,30 @@ func ApplyTriangle(dst []float32, mask []uint8, width, height int, c model.Candi
 		halfWidth := rx * (yr + ry) / (2.0 * ry)
 		return float32(math.Abs(float64(xr))) <= halfWidth
 	})
+}
+
+func applyPixels(dst []float32, mask []uint8, width, height, xMin, xMax, yMin, yMax int, cx, cy, cosT, sinT float32, c model.Candidate, insideFn func(xr, yr float32) bool) {
+	for y := yMin; y <= yMax; y++ {
+		for x := xMin; x <= xMax; x++ {
+			if mask[y*width+x] == 0 {
+				continue
+			}
+			dx := float32(x) + 0.5 - cx
+			dy := float32(y) + 0.5 - cy
+			xr := dx*cosT + dy*sinT
+			yr := -dx*sinT + dy*cosT
+			if !insideFn(xr, yr) {
+				continue
+			}
+			idx := (y*width + x) * 4
+			alpha := c.A
+			inv := 1.0 - alpha
+			dst[idx+0] = dst[idx+0]*inv + c.R*alpha
+			dst[idx+1] = dst[idx+1]*inv + c.G*alpha
+			dst[idx+2] = dst[idx+2]*inv + c.B*alpha
+			dst[idx+3] = dst[idx+3]*inv + alpha
+		}
+	}
 }
 
 func SavePNG(path string, pix []float32, width, height int) error {

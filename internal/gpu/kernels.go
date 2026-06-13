@@ -75,8 +75,15 @@ __kernel void evaluate_candidates_v3(
     float theta = thetaDeg * 0.01745329251994329577f;
     float cosT = cos(theta);
     float sinT = sin(theta);
-    float ex = fabs(rx * cosT) + fabs(ry * sinT);
-    float ey = fabs(rx * sinT) + fabs(ry * cosT);
+    float invRX2 = 1.0f / (rx * rx);
+    float invRY2 = 1.0f / (ry * ry);
+
+    float rx2 = rx * rx;
+    float ry2 = ry * ry;
+    float cos2 = cosT * cosT;
+    float sin2 = sinT * sinT;
+    float ex = sqrt(rx2 * cos2 + ry2 * sin2);
+    float ey = sqrt(rx2 * sin2 + ry2 * cos2);
 
     int xMin = (int)floor(cx - ex - 1.0f);
     int xMax = (int)ceil(cx + ex + 1.0f);
@@ -108,8 +115,6 @@ __kernel void evaluate_candidates_v3(
             float yr = -dx * sinT + dy * cosT;
             bool inside = false;
             if (shapeType == 1) {
-                float invRX2 = 1.0f / (rx * rx);
-                float invRY2 = 1.0f / (ry * ry);
                 inside = (xr * xr * invRX2 + yr * yr * invRY2 <= 1.0f);
             } else if (shapeType == 2) {
                 if (yr >= -ry && yr <= ry) {
@@ -119,7 +124,8 @@ __kernel void evaluate_candidates_v3(
             } else {
                 inside = (fabs(xr) <= rx && fabs(yr) <= ry);
             }
-            if (!inside) { continue;
+            if (!inside) {
+                continue;
             }
             int p = row + x;
             if (opaqueMask[p] == 0) {
@@ -243,8 +249,15 @@ __kernel void evaluate_candidates_v4(
     float theta = thetaDeg * 0.01745329251994329577f;
     float cosT = cos(theta);
     float sinT = sin(theta);
-    float ex = fabs(rx * cosT) + fabs(ry * sinT);
-    float ey = fabs(rx * sinT) + fabs(ry * cosT);
+    float invRX2 = 1.0f / (rx * rx);
+    float invRY2 = 1.0f / (ry * ry);
+
+    float rx2 = rx * rx;
+    float ry2 = ry * ry;
+    float cos2 = cosT * cosT;
+    float sin2 = sinT * sinT;
+    float ex = sqrt(rx2 * cos2 + ry2 * sin2);
+    float ey = sqrt(rx2 * sin2 + ry2 * cos2);
 
     int xMin = (int)floor(cx - ex - 1.0f);
     int xMax = (int)ceil(cx + ex + 1.0f);
@@ -284,8 +297,6 @@ __kernel void evaluate_candidates_v4(
         float yr = -dx * sinT + dy * cosT;
         bool inside = false;
         if (shapeType == 1) {
-            float invRX2 = 1.0f / (rx * rx);
-            float invRY2 = 1.0f / (ry * ry);
             inside = (xr * xr * invRX2 + yr * yr * invRY2 <= 1.0f);
         } else if (shapeType == 2) {
             if (yr >= -ry && yr <= ry) {
@@ -295,7 +306,8 @@ __kernel void evaluate_candidates_v4(
         } else {
             inside = (fabs(xr) <= rx && fabs(yr) <= ry);
         }
-        if (!inside) { continue; 
+        if (!inside) {
+            continue;
         }
         int p = y * width + x;
         if (opaqueMask[p] == 0) {
@@ -437,6 +449,8 @@ __kernel void apply_candidate_v2(
     float theta = thetaDeg * 0.01745329251994329577f;
     float cosT = cos(theta);
     float sinT = sin(theta);
+    float invRX2 = 1.0f / (rx * rx);
+    float invRY2 = 1.0f / (ry * ry);
 
     float dx = ((float)x + 0.5f) - cx;
     float dy = ((float)y + 0.5f) - cy;
@@ -444,18 +458,17 @@ __kernel void apply_candidate_v2(
     float yr = -dx * sinT + dy * cosT;
     bool inside = false;
     if (shapeType == 1) {
-        float invRX2 = 1.0f / (rx * rx);
-        float invRY2 = 1.0f / (ry * ry);
         inside = (xr * xr * invRX2 + yr * yr * invRY2 <= 1.0f);
     } else if (shapeType == 2) {
         if (yr >= -ry && yr <= ry) {
             float halfWidth = rx * (yr + ry) / (2.0f * ry);
-            inside = (fabs(xr) <= halfWidth);
+                inside = (fabs(xr) <= halfWidth);
         }
     } else {
-        inside = (fabs(xr) <= rx && fabs(yr) <= ry);
+            inside = (fabs(xr) <= rx && fabs(yr) <= ry);
     }
-    if (!inside) { return;
+    if (!inside) {
+        return;
     }
 
     float4 src = current[p];

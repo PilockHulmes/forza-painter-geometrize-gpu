@@ -48,6 +48,8 @@ void main() {
     float theta = thetaDeg * 0.01745329251994329577;
     float cosT = cos(theta);
     float sinT = sin(theta);
+    float invRX2 = 1.0 / (rx * rx);
+    float invRY2 = 1.0 / (ry * ry);
 
     float dx = (float(x) + 0.5) - cx;
     float dy = (float(y) + 0.5) - cy;
@@ -55,7 +57,7 @@ void main() {
     float yr = -dx * sinT + dy * cosT;
     bool inside = false;
     if (shapeType == 1) {
-        inside = (xr*xr*(1.0/(rx*rx)) + yr*yr*(1.0/(ry*ry)) <= 1.0);
+        inside = (xr * xr * invRX2 + yr * yr * invRY2 <= 1.0);
     } else if (shapeType == 2) {
         if (yr >= -ry && yr <= ry) {
             float halfWidth = rx * (yr + ry) / (2.0 * ry);

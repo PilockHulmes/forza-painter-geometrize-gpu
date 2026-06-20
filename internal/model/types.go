@@ -22,6 +22,7 @@ type Settings struct {
 	ErrorGridSize                 int
 	LoadGeometry                  string
 	ErrorMetric                   string
+	SsimWeight                    float32
 }
 
 type Shape struct {

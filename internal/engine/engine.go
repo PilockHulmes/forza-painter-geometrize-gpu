@@ -115,7 +115,8 @@ func Run(opts Options) error {
 	defer evaluator.Close()
 
 	if cfg.ErrorMetric == "ssim" {
-		fmt.Println("Error metric: SSIM (MSE/SSIM blended scoring)")
+		evaluator.SetSsimWeight(cfg.SsimWeight)
+		fmt.Printf("Error metric: SSIM (MSE/SSIM blended scoring, ssimWeight=%.2f)\n", cfg.SsimWeight)
 	} else {
 		fmt.Println("Error metric: MSE")
 	}

@@ -64,6 +64,7 @@ type Backend interface {
 	SetUseWorkGroupEval(bool)
 	SetSampleStep(int)
 	SetErrorMetric(string)
+	SetSsimWeight(float32)
 	SubmitSsimMap() error
 }
 

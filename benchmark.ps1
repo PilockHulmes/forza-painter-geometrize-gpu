@@ -25,7 +25,7 @@ if (-not (Test-Path $benchImages)) {
 
 $exes      = @(Get-ChildItem -Path $benchBin -Filter '*.exe' | Select-Object -ExpandProperty Name)
 $settings  = @(Get-ChildItem -Path $benchSettings -Filter '*.ini' | Select-Object -ExpandProperty Name)
-$images    = @(Get-ChildItem -Path $benchImages -Include '*.png','*.jpg','*.jpeg','*.bmp','*.webp','*.tiff','*.tif' | Select-Object -ExpandProperty Name)
+$images    = @(Get-ChildItem -Path "$benchImages\*" -Include '*.png','*.jpg','*.jpeg','*.bmp','*.webp','*.tiff','*.tif' | Select-Object -ExpandProperty Name)
 
 if ($exes.Count -eq 0) {
     Write-Host "ERROR: No .exe files found in $benchBin" -ForegroundColor Red
@@ -120,7 +120,7 @@ foreach ($exeName in $exes) {
 
         foreach ($img in $images) {
             $current++
-            $imgBase = [System.IO.Path]::GetFileNameWithoutExtension($img)
+            $imgBase = $img
             $imgPath = Join-Path $benchImages $img
 
             $imgDir = Join-Path $runDir $imgBase
@@ -234,7 +234,7 @@ foreach ($group in $grouped) {
     $txtLines += ""
 
     # Table header
-    $header = "{0,-35} {1,-30} {2,>8} {3,>8} {4,>8} {5,>8} {6,>8} {7}" -f `
+    $header = "{0,-35} {1,-30} {2,8} {3,8} {4,8} {5,8} {6,8} {7}" -f `
         "Exe / Settings", "GPU", "Shapes", "AvgMs", "MinMs", "MaxMs", "TotalS", "Status"
     $txtLines += $header
     $txtLines += "-" * ($header.Length)

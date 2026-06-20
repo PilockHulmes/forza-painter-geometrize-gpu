@@ -862,6 +862,11 @@ func (e *Evaluator) SubmitErrorGrid() (GridTicket, error) {
 		); err != nil {
 			return GridTicket{}, err
 		}
+		kernelEvt, err := e.queue.EnqueueNDRangeKernel(e.ssimErrorGridKernel, nil, []int{e.gridW, e.gridH}, nil, nil)
+		if err != nil {
+			return GridTicket{}, err
+		}
+		kernelEvt.Release()
 	} else {
 		if err := e.gridKernel.SetArgs(
 			e.targetBuffer,
@@ -875,12 +880,12 @@ func (e *Evaluator) SubmitErrorGrid() (GridTicket, error) {
 		); err != nil {
 			return GridTicket{}, err
 		}
+		kernelEvt, err := e.queue.EnqueueNDRangeKernel(e.gridKernel, nil, []int{e.gridW, e.gridH}, nil, nil)
+		if err != nil {
+			return GridTicket{}, err
+		}
+		kernelEvt.Release()
 	}
-	kernelEvt, err := e.queue.EnqueueNDRangeKernel(e.gridKernel, nil, []int{e.gridW, e.gridH}, nil, nil)
-	if err != nil {
-		return GridTicket{}, err
-	}
-	kernelEvt.Release()
 
 	readEvt, err := e.queue.EnqueueReadBufferFloat32(e.errorGridBufs[slot], false, 0, e.hostErrorGrids[slot], nil)
 	if err != nil {
@@ -995,19 +1000,10 @@ func (e *Evaluator) SetSsimWeight(w float32) {
 // without blocking. The returned GridTicket can be waited on with
 // WaitErrorGrid (reuses the same ticket type since the readback flow
 // is identical).
-func (e *Evaluator) SubmitSsimMap() (GridTicket, error) {
-	slot := e.nextSsimMapSlot
-	e.nextSsimMapSlot = (e.nextSsimMapSlot + 1) % ringSize
-
-	if e.ssimMapSlots[slot].busy {
-		err := cl.WaitForEvents([]*cl.Event{e.ssimMapSlots[slot].readEvt})
-		e.ssimMapSlots[slot].readEvt.Release()
-		e.ssimMapSlots[slot].readEvt = nil
-		e.ssimMapSlots[slot].busy = false
-		if err != nil {
-			return GridTicket{}, err
-		}
-	}
+func (e *Evaluator) SubmitSsimMap() error {
+	// SSIM map is device-only — no host readback. The in-order queue
+	// guarantees that any subsequent eval / error-grid kernel sees the
+	// updated map.
 
 	// Pass 1: horizontal box filter — target/current → 5 mean buffers.
 	if err := e.boxFilterHKernel.SetArgs(
@@ -1021,15 +1017,17 @@ func (e *Evaluator) SubmitSsimMap() (GridTicket, error) {
 		int32(e.width),
 		int32(e.height),
 	); err != nil {
-		return GridTicket{}, err
+		return err
 	}
 	if evt, err := e.queue.EnqueueNDRangeKernel(e.boxFilterHKernel, nil, []int{e.width, e.height}, nil, nil); err != nil {
-		return GridTicket{}, err
+		return err
 	} else {
 		evt.Release()
 	}
 
 	// Pass 2: vertical box filter + SSIM → ssim_map buffer.
+	slot := e.nextSsimMapSlot
+	e.nextSsimMapSlot = (e.nextSsimMapSlot + 1) % ringSize
 	if err := e.boxFilterVKernel.SetArgs(
 		e.ssimMeanBufT,
 		e.ssimMeanBufC,
@@ -1040,27 +1038,16 @@ func (e *Evaluator) SubmitSsimMap() (GridTicket, error) {
 		int32(e.width),
 		int32(e.height),
 	); err != nil {
-		return GridTicket{}, err
+		return err
 	}
 	if evt, err := e.queue.EnqueueNDRangeKernel(e.boxFilterVKernel, nil, []int{e.width, e.height}, nil, nil); err != nil {
-		return GridTicket{}, err
+		return err
 	} else {
 		evt.Release()
 	}
 
-	readEvt, err := e.queue.EnqueueReadBufferFloat32(e.ssimMapBufs[slot], false, 0, e.hostSsimMaps[slot], nil)
-	if err != nil {
-		return GridTicket{}, err
-	}
-
-	e.ssimMapSeq++
-	e.ssimMapSlots[slot] = gridSlot{
-		readEvt: readEvt,
-		seq:     e.ssimMapSeq,
-		busy:    true,
-	}
 	e.lastSsimMapSlot = slot
-	return GridTicket{slot: slot, seq: e.ssimMapSeq, valid: true}, nil
+	return nil
 }
 
 func scoreDevice(d *cl.Device) int64 {
